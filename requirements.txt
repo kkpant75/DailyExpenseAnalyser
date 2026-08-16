@@ -1,0 +1,6 @@
+streamlit>=1.20
+pandas>=2.0
+openpyxl
+requests
+matplotlib
+python-dotenv>=1.0
