@@ -1140,7 +1140,8 @@ def main():
                     _spdf[c] = _sdf[c].values if c in _sdf.columns else None
             _spdf["amount"] = pd.to_numeric(_spdf["amount"], errors="coerce")
             if "date" in _spdf.columns:
-                _spdf["date"] = pd.to_datetime(_spdf["date"], errors="coerce", dayfirst=True)
+                _spdf["date"] = _spdf["date"].astype(str).str.replace(r"\s*(IST|UTC|GMT|PST|EST|CST|MST)\s*$", "", regex=True, flags=re.I)
+                _spdf["date"] = pd.to_datetime(_spdf["date"], format="mixed", dayfirst=True, errors="coerce")
             _spdf["merchant"] = _spdf["merchant"].fillna("Unknown")
             _spdf["category"] = _spdf["category"].fillna("Uncategorized")
 
@@ -1323,54 +1324,80 @@ def main():
                     _story_html += f'<div class="story-item"><span class="story-icon">{_icon}</span><span>{_text}</span></div>'
                 _story_html += '</div>'
 
-                # ── Value-Added Purchases Box ────────────────────────────
-                # Strict keyword matching — must be actual product/brand names, NOT generic words
-                _val_brands = (
+                # ── Significant Purchases Box ────────────────────────────
+                # Track A: Electronics / Gadgets / Appliances
+                _elec_kw = (
                     "Samsung|Apple|iPhone|iPad|MacBook|Galaxy|Pixel|OnePlus|Nothing Phone|"
                     "Sony|LG|Whirlpool|IFB|Bosch|Voltas|Daikin|Blue Star|Crompton|Havells|"
                     "Philips|Panasonic|Midea|Carrier|Hitachi|Orient|Bajaj Electricals|"
                     "Croma|Reliance Digital|Vijay Sales|"
-                    "Dyson|Nutribullet|KitchenAid|Prestige|Preethi|Havells|Borosil|"
+                    "Dyson|KitchenAid|Prestige|Preethi|Borosil|"
                     "IKEA|Godrej|Sleepwell|Wakefit|"
-                    "GoPro|DSLR|Canon|Nikon|Fujifilm|"
+                    "Canon|Nikon|Fujifilm|GoPro|"
                     "Titan|Fastrack|Fossil|Casio|G-Shock|"
-                    "PS5|Xbox|Nintendo|ROG|ASUS|"
+                    "PS5|Xbox|Nintendo|ROG|ASUS|Alienware|"
                     "Boat|JBL|Bose|Sennheiser|"
-                    "Apple Watch|AirPods|Galaxy Watch|Galaxy Buds"
-                )
-                _val_products = (
                     "Laptop|MacBook|iPhone|iPad|Galaxy S|Galaxy Z|Galaxy A|Pixel|OnePlus|"
                     "Washing Machine|Refrigerator|Fridge|Air Conditioner|AC |Split AC|Window AC|"
                     "Microwave|Oven|Dishwasher|Dryer|"
-                    "Television|TV |Smart TV|OLED|QLED|4K|"
+                    "Television|TV |Smart TV|OLED|QLED|"
                     "Monitor|Printer|Desktop|"
                     "Speaker|Soundbar|Headphone|Earbuds|"
-                    "Camera|GoPro|DSLR|Mirrorless|Lens|"
-                    "Sofa|Wardrobe|Bed Frame|Mattress|IKEA|"
-                    "Mixer Grinder|Food Processor|Blender|Air Purifier|Water Purifier|Geyser|Inverter|Battery|"
+                    "Camera|DSLR|Mirrorless|Lens|"
+                    "Sofa|Wardrobe|Bed Frame|Mattress|"
+                    "Mixer Grinder|Food Processor|Blender|Air Purifier|Water Purifier|Geyser|Inverter|"
                     "Gaming Console|PS5|Xbox Series|Nintendo Switch|"
                     "Smart Watch|Fitness Band|"
-                    "Galaxy S26|Galaxy S25|Galaxy Z|iPhone 16|iPhone 15|"
-                    "ROG|Alienware|ThinkPad|MacBook Air|MacBook Pro"
+                    "Galaxy S26|Galaxy S25|iPhone 16|iPhone 15|"
+                    "ROG|ThinkPad|MacBook Air|MacBook Pro"
                 )
-                # exclusion: food/restaurant/travel/financial context kills the match
-                _val_exclude = "Restaurant|Cafe|Food|Swiggy|Zomato|Hotel|Flight|Train|Bus|Petrol|Diesel|Fuel|Taxi|Uber|Ola|ATM|Salary|Insurance|Bill|Recharge|Subscription|Pharmacy|Hospital|Credit Card Bill|EMI|Loan|Mutual Fund|Stock|Investment"
-                # minimum amount to qualify as value-add
-                _VAL_MIN = 1500
+                # Track B: Travel / Lifestyle experiences
+                _travel_kw = (
+                    "Flight|Airline|Air India|IndiGo|SpiceJet|Vistara|GoFirst|Akasa|"
+                    "Emirates|Qatar Airways|Singapore Airlines|Lufthansa|British Airways|"
+                    "MakeMyTrip|Cleartrip|Yatra|Goibibo|Skyscanner|"
+                    "Hotel|OYO|Marriott|Hilton|Hyatt|Radisson|"
+                    "IRCTC|Train Ticket|First Class|Business Class|"
+                    "Resort|Spa Day|Wellness|Retreat|"
+                    "Cruise|Yacht|Safari|Trek|Expedition"
+                )
+                # Exclusion: ONLY food/daily bills/financial — NO travel/electronics
+                _val_exclude = "Restaurant|Cafe|Food|Swiggy|Zomato|Petrol|Diesel|Fuel|Taxi|Uber|Ola|ATM|Salary|Insurance|Bill|Recharge|Subscription|Pharmacy|Hospital|Credit Card Bill|EMI|Loan|Mutual Fund|Stock|Investment|Grocery|Supermarket|Department Store"
+
+                _ELEC_MIN = 1500
+                _TRAVEL_MIN = 5000
 
                 if len(_debits):
-                    _match_brand = _debits["category"].str.contains(_val_brands, case=False, na=False) | _debits["merchant"].str.contains(_val_brands, case=False, na=False)
-                    _match_product = _debits["category"].str.contains(_val_products, case=False, na=False) | _debits["merchant"].str.contains(_val_products, case=False, na=False)
-                    # check raw_text directly from _debits (already has it from _spdf)
                     _debits_raw = _debits["raw_text"].fillna("").str.lower() if "raw_text" in _debits.columns else pd.Series([""]*len(_debits), index=_debits.index)
-                    _raw_brand = _debits_raw.str.contains(_val_brands, case=False, na=False)
-                    _raw_product = _debits_raw.str.contains(_val_products, case=False, na=False)
-                    _match_all = (_match_brand | _match_product | _raw_brand | _raw_product)
-                    # exclude food/travel/financial context
-                    _excl = _debits["category"].str.contains(_val_exclude, case=False, na=False) | _debits["merchant"].str.contains(_val_exclude, case=False, na=False)
-                    # minimum amount filter
-                    _min_amt = _debits["amount"] >= _VAL_MIN
-                    _val_matches = _debits[_match_all & ~_excl & _min_amt].copy()
+
+                    # Track A: electronics
+                    _elec_m = (
+                        _debits["category"].str.contains(_elec_kw, case=False, na=False)
+                        | _debits["merchant"].str.contains(_elec_kw, case=False, na=False)
+                        | _debits_raw.str.contains(_elec_kw, case=False, na=False)
+                    )
+                    _elec_excl = (
+                        _debits["category"].str.contains(_val_exclude, case=False, na=False)
+                        | _debits["merchant"].str.contains(_val_exclude, case=False, na=False)
+                    )
+                    _elec_match = _debits[_elec_m & ~_elec_excl & (_debits["amount"] >= _ELEC_MIN)].copy()
+                    _elec_match["__track"] = "electronics"
+
+                    # Track B: travel
+                    _trav_m = (
+                        _debits["category"].str.contains(_travel_kw, case=False, na=False)
+                        | _debits["merchant"].str.contains(_travel_kw, case=False, na=False)
+                        | _debits_raw.str.contains(_travel_kw, case=False, na=False)
+                    )
+                    _trav_excl = (
+                        _debits["category"].str.contains(_val_exclude, case=False, na=False)
+                        | _debits["merchant"].str.contains(_val_exclude, case=False, na=False)
+                    )
+                    _trav_match = _debits[_trav_m & ~_trav_excl & (_debits["amount"] >= _TRAVEL_MIN)].copy()
+                    _trav_match["__track"] = "travel"
+
+                    # Combine — drop duplicates (some may match both)
+                    _val_matches = pd.concat([_elec_match, _trav_match]).drop_duplicates(subset=["amount", "merchant", "date"])
                 else:
                     _val_matches = pd.DataFrame()
 
@@ -1386,31 +1413,39 @@ def main():
                     # tag each purchase
                     def _tag_item(row):
                         t = str(row.get("category", "") + " " + row.get("merchant", "") + " " + _get_raw(row)).lower()
+                        track = row.get("__track", "")
+                        if track == "travel":
+                            if any(k.lower() in t for k in ["flight", "airline", "air india", "indigo", "emirates", "vistara", "spicejet", "makemytrip", "cleartrip", "yatra", "booking"]):
+                                return ("✈️", "Flight", "tag-travel")
+                            if any(k.lower() in t for k in ["hotel", "oyo", "taj", "oberoi", "marriott", "hilton", "hyatt", "radisson", "itc", "resort"]):
+                                return ("🏨", "Hotel Stay", "tag-travel")
+                            if any(k.lower() in t for k in ["irctc", "train", "first class", "business class"]):
+                                return ("🚂", "Train Journey", "tag-travel")
+                            return ("🧳", "Travel", "tag-travel")
+                        # electronics track
                         if any(k.lower() in t for k in ["samsung", "apple", "iphone", "ipad", "galaxy", "pixel", "oneplus", "nothing phone", "mobile", "phone", "tablet"]):
                             return ("📱", "Smart Device", "tag-phone")
-                        if any(k.lower() in t for k in ["laptop", "macbook", "monitor", "printer", "computer", "desktop"]):
+                        if any(k.lower() in t for k in ["laptop", "macbook", "monitor", "printer", "computer", "desktop", "thinkpad"]):
                             return ("💻", "Computing", "tag-gadget")
-                        if any(k.lower() in t for k in ["tv", "television", "speaker", "headphone", "sound", "sony", "bose", "jbl"]):
+                        if any(k.lower() in t for k in ["tv", "television", "speaker", "headphone", "sound", "sony", "bose", "jbl", "soundbar"]):
                             return ("📺", "Entertainment Tech", "tag-gadget")
                         if any(k.lower() in t for k in ["washing", "refrigerator", "fridge", "ac ", "air conditioner", "microwave", "oven", "dishwasher", "dryer"]):
                             return ("🏠", "Home Appliance", "tag-appliance")
-                        if any(k.lower() in t for k in ["ac", "daikin", "voltas", "blue star", "carrier", "hitachi", "crompton", "inverter", "battery", "geyser", "purifier"]):
+                        if any(k.lower() in t for k in ["daikin", "voltas", "blue star", "carrier", "hitachi", "crompton", "inverter", "geyser", "purifier"]):
                             return ("❄️", "Climate & Power", "tag-appliance")
-                        if any(k.lower() in t for k in ["furniture", "sofa", "bed", "wardrobe", "table", "chair", "ikea", "wood"]):
+                        if any(k.lower() in t for k in ["furniture", "sofa", "bed", "wardrobe", "ikea", "mattress"]):
                             return ("🪑", "Furniture", "tag-furniture")
-                        if any(k.lower() in t for k in ["camera", "gopro", "dslr", "lens"]):
+                        if any(k.lower() in t for k in ["camera", "gopro", "dslr", "lens", "canon", "nikon"]):
                             return ("📷", "Camera", "tag-gadget")
-                        if any(k.lower() in t for k in ["watch", "titan", "fastrack", "fossil", "g-shock"]):
+                        if any(k.lower() in t for k in ["watch", "titan", "fossil", "g-shock"]):
                             return ("⌚", "Watch", "tag-luxury")
-                        if any(k.lower() in t for k in ["ps5", "xbox", "nintendo", "rog", "gaming", "controller"]):
+                        if any(k.lower() in t for k in ["ps5", "xbox", "nintendo", "rog", "gaming"]):
                             return ("🎮", "Gaming", "tag-gadget")
-                        if any(k.lower() in t for k in ["kitchen", "mixer", "grinder", "blender", "prestige", "preethi", "bajaj"]):
+                        if any(k.lower() in t for k in ["mixer", "grinder", "blender", "prestige", "preethi"]):
                             return ("🍳", "Kitchen", "tag-home")
-                        if any(k.lower() in t for k in ["croma", "reliance digital", "vijay sales"]):
-                            return ("🏪", "Electronics Store", "tag-other")
                         return ("📦", "Purchase", "tag-other")
 
-                    _val_stories = [
+                    _elec_stories = [
                         "A wise person once said 'treat yourself' — and you took that advice VERY seriously.",
                         "This one's going to sit in your life for years. An investment in daily happiness!",
                         "Your future self is already high-fiving your present self for this buy.",
@@ -1427,11 +1462,25 @@ def main():
                         "Your home just got smarter/cooler/more comfortable. Mission accomplished.",
                         "Return on investment: measured in daily smiles, not percentages.",
                     ]
+                    _travel_stories = [
+                        "You can't put a price on memories... but your bank account sure tried. BOOKED!",
+                        "Passport: packed. Bags: ready. Wallet: crying. WORTH IT.",
+                        "The best stories come from the best trips. This is the BEGINNING.",
+                        "Work-life balance just got a MASSIVE upgrade. Bon voyage!",
+                        "Adventure called. You answered. With your credit card. But still.",
+                        "Plane tickets > material things. You chose MEMORIES over STUFF. Legend.",
+                        "Your Instagram is about to get a serious glow-up. Jet set GO!",
+                        "Life is short. Book the flight. Pack the bag. Go. JUST GO.",
+                        "This trip will give you stories for YEARS. Best investment ever.",
+                        "The countdown starts NOW. Anticipation is half the fun!",
+                        "Somewhere between departure and arrival, you'll find pure bliss.",
+                        "Your future vacation self is already thanking your present self.",
+                    ]
 
                     _val_html = (
                         f'<div class="valuebox">'
-                        f'<h4>✨ Your {_month_label} Value-Upgrades — Things That Level Up Your Life</h4>'
-                        f'<div class="v-subtitle">₹{_val_total:,.0f} invested across <b>{_val_count}</b> upgrades ({_val_pct}% of total spend) — every rupee working to make your daily life better</div>'
+                        f'<h4>✨ Your {_month_label} Life Upgrades</h4>'
+                        f'<div class="v-subtitle">₹{_val_total:,.0f} invested across <b>{_val_count}</b> upgrades ({_val_pct}% of total spend) — purchases that level up your daily life</div>'
                     )
 
                     for _, vr in _val_matches.iterrows():
@@ -1439,11 +1488,25 @@ def main():
                         _amt = vr.get("amount", 0)
                         _merchant = vr.get("merchant", "Unknown")
                         _raw = _get_raw(vr)
-                        _story = random.choice(_val_stories)
+                        _track = vr.get("__track", "electronics")
+                        _story = random.choice(_travel_stories if _track == "travel" else _elec_stories)
 
                         _product_hint = ""
                         _raw_lower = _raw.lower()
-                        if "samsung" in _raw_lower and ("galaxy" in _raw_lower or "s " in _raw_lower):
+                        if _track == "travel":
+                            if "emirates" in _raw_lower or "qatar" in _raw_lower or "singapore" in _raw_lower:
+                                _product_hint = " — premium international travel. You're flying in STYLE."
+                            elif "dubai" in _raw_lower or "london" in _raw_lower or "paris" in _raw_lower or "tokyo" in _raw_lower:
+                                _product_hint = " — international adventure loading! Pack light, dream big."
+                            elif "domestic" in _raw_lower or "india" in _raw_lower:
+                                _product_hint = " — exploring the homeland! India is massive, go see it all."
+                            elif "hotel" in _raw_lower or "taj" in _raw_lower or "marriott" in _raw_lower:
+                                _product_hint = " — luxury stay unlocked. Your comfort just went premium."
+                            elif "resort" in _raw_lower or "spa" in _raw_lower:
+                                _product_hint = " — relaxation mode: ACTIVATED. You earned this."
+                            else:
+                                _product_hint = " — new destination incoming! Adventures await."
+                        elif "samsung" in _raw_lower and ("galaxy" in _raw_lower or "s " in _raw_lower or "s26" in _raw_lower or "s25" in _raw_lower):
                             _product_hint = " — a Samsung Galaxy upgrade! Welcome to the flagship club."
                         elif "apple" in _raw_lower or "iphone" in _raw_lower or "ipad" in _raw_lower:
                             _product_hint = " — the Apple ecosystem just got another member."
@@ -1472,11 +1535,11 @@ def main():
                         )
 
                     _val_close = [
-                        f"That's {_val_count} upgrade(s) this month. Your lifestyle game is STRONG. 💪",
-                        f"₹{_val_total:,.0f} well spent on things that matter every single day. No regrets here!",
+                        f"That's {_val_count} life upgrade(s) this month. Your lifestyle game is STRONG. 💪",
+                        f"₹{_val_total:,.0f} well spent on things and experiences that matter. No regrets here!",
                         f"You're not just spending, you're CURATING A BETTER LIFE. Respect. 🙌",
                     ]
-                    _val_html += f'<div class="story-item" style="margin-top:0.8rem;"><span class="story-icon">🏆</span><span><b>UPGRADE VERDICT:</b> {random.choice(_val_close)}</span></div>'
+                    _val_html += f'<div class="story-item" style="margin-top:0.8rem;"><span class="story-icon">🏆</span><span><b>VERDICT:</b> {random.choice(_val_close)}</span></div>'
                     _val_html += '</div>'
 
                 # ── Render side by side ──
@@ -1489,8 +1552,8 @@ def main():
                     else:
                         st.markdown(
                             '<div class="valuebox" style="opacity:0.7;">'
-                            '<h4>✨ Value-Upgrades</h4>'
-                            '<div class="v-subtitle">No electronics, gadgets, appliances, or lifestyle upgrades detected this month yet.</div>'
+                            '<h4>✨ Life Upgrades</h4>'
+                            '<div class="v-subtitle">No significant purchases, electronics, or travel bookings detected this month yet.</div>'
                             '</div>',
                             unsafe_allow_html=True,
                         )
