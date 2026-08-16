@@ -636,8 +636,147 @@ def load_records() -> pd.DataFrame:
     return combined
 
 
+def inject_custom_css():
+    st.markdown("""
+    <style>
+    /* ===== Global ===== */
+    .block-container { padding-top: 1rem !important; max-width: 1200px; }
+
+    /* ===== Title Banner ===== */
+    .app-header {
+        background: linear-gradient(135deg, #1a237e 0%, #283593 50%, #3949ab 100%);
+        color: #fff; padding: 1.4rem 2rem; border-radius: 12px;
+        margin-bottom: 1.2rem; box-shadow: 0 4px 15px rgba(26,35,126,0.3);
+        display: flex; align-items: center; justify-content: space-between;
+    }
+    .app-header h1 { margin: 0; font-size: 1.6rem; text-shadow: 0 2px 4px rgba(0,0,0,0.2); }
+    .app-header .subtitle { font-size: 0.85rem; opacity: 0.85; }
+
+    /* ===== Sidebar ===== */
+    section[data-testid="stSidebar"] { background-color: #f8f9fa; }
+    section[data-testid="stSidebar"] .stHeader { background-color: transparent; }
+    section[data-testid="stSidebar"] h2,
+    section[data-testid="stSidebar"] h3 { color: #1a237e !important; }
+
+    /* ===== Buttons ===== */
+    .stButton > button {
+        border-radius: 8px; font-weight: 600; border: none;
+        padding: 0.55rem 1.5rem; transition: all 0.2s ease;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+    }
+    .stButton > button:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+    .stButton > button:active { transform: translateY(0); }
+
+    /* Primary green buttons (Parse) */
+    div[data-testid="stVerticalBlock"] button[kind="primary"],
+    .btn-green {
+        background: linear-gradient(135deg, #2e7d32, #43a047) !important; color: #fff !important;
+    }
+    /* Blue buttons (Send) */
+    .btn-blue { background: linear-gradient(135deg, #1565c0, #1e88e5) !important; color: #fff !important; }
+    /* Purple buttons (Generate) */
+    .btn-purple { background: linear-gradient(135deg, #6a1b9a, #8e24aa) !important; color: #fff !important; }
+
+    /* ===== Inputs ===== */
+    .stTextArea textarea, .stTextInput input {
+        border: 1.5px solid #e0e0e0 !important; border-radius: 8px !important;
+        transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .stTextArea textarea:focus, .stTextInput input:focus {
+        border-color: #3949ab !important; box-shadow: 0 0 0 3px rgba(57,73,171,0.15) !important;
+    }
+
+    /* ===== Tabs ===== */
+    .stTabs [data-baseweb="tab"] { font-weight: 600; font-size: 0.95rem; }
+    .stTabs [aria-selected="true"] { color: #1a237e !important; border-bottom-color: #1a237e !important; }
+
+    /* ===== Metric Cards ===== */
+    .metric-card {
+        padding: 1rem 1.2rem; border-radius: 10px; margin-bottom: 0.8rem;
+        border-left: 5px solid; background: #fff;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+    }
+    .metric-card .label { font-size: 0.82rem; color: #757575; margin-bottom: 0.3rem; text-transform: uppercase; letter-spacing: 0.5px; }
+    .metric-card .value { font-size: 1.6rem; font-weight: 700; }
+    .mc-red    { border-color: #c62828; } .mc-red .value    { color: #c62828; }
+    .mc-green  { border-color: #2e7d32; } .mc-green .value  { color: #2e7d32; }
+    .mc-blue   { border-color: #1565c0; } .mc-blue .value   { color: #1565c0; }
+    .mc-purple { border-color: #6a1b9a; } .mc-purple .value  { color: #6a1b9a; }
+
+    /* ===== Section Headers ===== */
+    .section-hdr {
+        border-bottom: 2.5px solid #1a237e; padding-bottom: 0.45rem;
+        margin: 1.6rem 0 1rem 0;
+    }
+    .section-hdr h3 { margin: 0; color: #1a237e; font-size: 1.15rem; }
+
+    /* ===== Chat Bubbles ===== */
+    .chat-user {
+        background: #e3f2fd; padding: 0.85rem 1rem; border-radius: 14px 14px 2px 14px;
+        margin: 0.5rem 0; max-width: 82%; margin-left: auto;
+        border: 1px solid #bbdefb;
+    }
+    .chat-asst {
+        background: #f5f5f5; padding: 0.85rem 1rem; border-radius: 14px 14px 14px 2px;
+        margin: 0.5rem 0; max-width: 82%; margin-right: auto;
+        border: 1px solid #e0e0e0;
+    }
+    .chat-label { font-size: 0.78rem; font-weight: 700; margin-bottom: 0.25rem; }
+    .chat-user .chat-label { color: #1565c0; }
+    .chat-asst .chat-label { color: #2e7d32; }
+
+    /* ===== Expanders ===== */
+    .streamlit-expanderHeader { font-weight: 600 !important; }
+
+    /* ===== Radio / Selectboxes ===== */
+    .stRadio > div { gap: 0.5rem; }
+
+    /* ===== Misc ===== */
+    .stAlert { border-radius: 8px !important; }
+    hr { border: none; border-top: 1px solid #e0e0e0; margin: 1rem 0; }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def metric_card(title: str, value: str, color_cls: str):
+    st.markdown(
+        f'<div class="metric-card {color_cls}">'
+        f'<div class="label">{title}</div>'
+        f'<div class="value">{value}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def section_header(text: str):
+    st.markdown(f'<div class="section-hdr"><h3>{text}</h3></div>', unsafe_allow_html=True)
+
+
+def styled_title(model: str):
+    st.markdown(
+        f'<div class="app-header">'
+        f'<div><h1>Daily Expense Analyser</h1>'
+        f'<div class="subtitle">Powered by {model}</div></div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def chat_bubble(role: str, text: str):
+    cls = "chat-user" if role == "You" else "chat-asst"
+    label_color = "#1565c0" if role == "You" else "#2e7d32"
+    st.markdown(
+        f'<div class="{cls}">'
+        f'<div class="chat-label" style="color:{label_color};">{role}</div>'
+        f'<div>{text}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def main():
     st.set_page_config(page_title="Daily Expense Analyser", layout="wide")
+    inject_custom_css()
 
     # --- Sidebar: Endpoint preference ---
     with st.sidebar:
@@ -683,17 +822,20 @@ def main():
             selected_model = "Unconfigured"
 
     selected_model = os.getenv("OLLAMA_LOCAL_MODEL", "llama3.2:latest") if st.session_state.use_local and os.getenv("OLLAMA_API") else os.getenv("OLLAMA_CLOUD_MODEL", "gpt-oss:120b-cloud") if os.getenv("OLLAMA_CLOUD_BASE_URL") and os.getenv("OLLAMA_CLOUD_API_KEY") else "Unconfigured"
-    st.title(f"Daily Expense Analyser ({selected_model})")
+    styled_title(selected_model)
 
-    tabs = st.tabs(["Input & Parse", "Chatbot", "Analysis"])
+    tabs = st.tabs(["Add Transactions", "Chatbot", "Analysis"])
 
     # --- Input & Parse ---
     with tabs[0]:
-        st.header("Parse a transaction or SMS")
         parse_mode = st.radio("Select mode:", ["Single Transaction", "Bulk SMS (multiple)"], horizontal=True)
         raw = st.text_area("Paste SMS / bank transaction text here", height=150)
         
-        if st.button("Parse and Save"):
+        btn_cols = st.columns([6, 1])
+        with btn_cols[1]:
+            parse_clicked = st.button("Parse and Save", type="primary", use_container_width=True)
+        
+        if parse_clicked:
             if not raw.strip():
                 st.error("Please provide some text to parse.")
             else:
@@ -728,7 +870,7 @@ def main():
                         progress_text.write(f"Completed {total_txns}/{total_txns} transactions.")
                         
                         st.success(f"✓ Saved {len(results)} transactions to Excel")
-                        st.subheader("Parsed Results")
+                        section_header("Parsed Results")
                         for r in results:
                             with st.expander(f"Transaction {r['txn_num']}"):
                                 st.write(f"**Raw:** {r['raw'][:100]}...")
@@ -742,7 +884,6 @@ def main():
                         "If a field is not present, set it to null. Return ONLY valid JSON (no extra commentary).\n\n"
                         "For CATEGORY, use one of these options (important!):\n" + category_guide + "\n"
                         f"Input:\n{raw}\n\nOutput JSON:")
-                    # Show progress for single-transaction parsing
                     progress_text = st.empty()
                     progress_bar = st.progress(0)
                     progress_text.write("Processing...")
@@ -755,7 +896,7 @@ def main():
                     append_record(raw, parsed)
                     progress_bar.progress(100)
                     progress_text.write("Completed")
-                    st.subheader("Parsed JSON")
+                    section_header("Parsed JSON")
                     st.json(parsed or {"warning": "Could not parse LLM response, raw output shown below", "raw": resp})
 
     # --- Chatbot ---
@@ -763,29 +904,87 @@ def main():
         st.header("Expense Assistant Chatbot")
         if "history" not in st.session_state:
             st.session_state.history = []
+        if "chat_processing" not in st.session_state:
+            st.session_state.chat_processing = False
 
-        cols = st.columns([4, 1])
-        with cols[0]:
-            user_input = st.text_input("Ask about your expenses or chat with the assistant")
-        with cols[1]:
-            if st.button("Send") and user_input.strip():
-                # prepare short context from latest records
-                df = load_records()
-                recent = df.tail(10)
-                context = "Latest records:\n"
-                for _, r in recent.iterrows():
-                    context += f"- {r.raw_text} | parsed: {r.parsed}\n"
-                system_prompt = (
-                    "You are an assistant specialized in personal finance and transaction parsing. "
-                    "Answer concisely and use the provided recent records when relevant.\n\n"
-                )
-                prompt = system_prompt + "Context:\n" + context + "\nUser: " + user_input + "\nAssistant:"
-                answer = call_ollama(prompt, prefer_local=st.session_state.use_local)
-                st.session_state.history.append({"user": user_input, "assistant": answer})
-
+        # Display existing chat history
         for msg in reversed(st.session_state.history):
-            st.markdown(f"**You:** {msg['user']}")
-            st.markdown(f"**Assistant:** {msg['assistant']}")
+            chat_bubble("You", msg['user'])
+            chat_bubble("Assistant", msg['assistant'])
+
+        # Form enables Enter-to-submit and prevents double-clicks during processing
+        with st.form("chat_form", clear_on_submit=False):
+            user_input = st.text_input(
+                "Ask about your transactions (e.g. 'get all ATM transactions', 'total spent on food')",
+                placeholder="Type your question and press Enter...",
+            )
+            submitted = st.form_submit_button(
+                "Search",
+                type="primary",
+                use_container_width=True,
+                disabled=st.session_state.chat_processing,
+            )
+
+        if submitted and user_input.strip():
+            st.session_state.chat_processing = True
+            st.rerun()
+
+        # Process after form submit (rerun enters here with flag set)
+        if st.session_state.chat_processing and user_input.strip():
+            # show live status updates while processing
+            with st.status("Processing your query...", expanded=True) as status:
+                st.write("Loading transaction records from Excel...")
+                df = load_records()
+                total_records = len(df)
+
+                if df.empty:
+                    st.write("No records found in the database.")
+                    context = "No records found in the database."
+                else:
+                    st.write(f"Loaded **{total_records}** records. Building search context...")
+                    for col in ["date", "amount", "merchant", "category", "status", "currency", "raw_text"]:
+                        if col not in df.columns:
+                            df[col] = ""
+
+                    lines = []
+                    for idx, r in df.iterrows():
+                        date_str = str(r.get("date", "")) if pd.notna(r.get("date")) else "N/A"
+                        amt = r.get("amount", "")
+                        amt_str = f"₹{float(amt):,.2f}" if pd.notna(amt) and amt != "" else "N/A"
+                        merchant = str(r.get("merchant", "Unknown")) if pd.notna(r.get("merchant")) else "Unknown"
+                        category = str(r.get("category", "Uncategorized")) if pd.notna(r.get("category")) else "Uncategorized"
+                        status_val = str(r.get("status", "")) if pd.notna(r.get("status")) else ""
+                        currency = str(r.get("currency", "INR")) if pd.notna(r.get("currency")) else "INR"
+                        raw_text = str(r.get("raw_text", "")) if pd.notna(r.get("raw_text")) else ""
+
+                        line = (
+                            f"[{idx+1}] Date: {date_str} | Amount: {amt_str} | "
+                            f"Merchant: {merchant} | Category: {category} | "
+                            f"Status: {status_val} | Currency: {currency} | "
+                            f"Raw: {raw_text}"
+                        )
+                        lines.append(line)
+
+                    context = f"Total records: {total_records}\n\nAll transactions:\n" + "\n".join(lines)
+
+                st.write(f"Sending **{total_records}** records to LLM. Waiting for response...")
+                system_prompt = (
+                    "You are a personal finance assistant. You have access to the user's COMPLETE transaction history.\n"
+                    "IMPORTANT RULES:\n"
+                    "1. Search through ALL records provided to answer the user's question.\n"
+                    "2. Filter records by the user's criteria (date range, amount, merchant, category, status, etc.).\n"
+                    "3. When asked for specific transactions (e.g. ATM, Swiggy, salary), list ALL matching records with full details.\n"
+                    "4. If the user asks for a summary, calculate totals from the matching records.\n"
+                    "5. Always reference record numbers [N] when listing transactions.\n"
+                    "6. If no matching records are found, say so clearly.\n\n"
+                )
+                prompt = system_prompt + "Context:\n" + context + "\n\nUser question: " + user_input + "\nAssistant:"
+                answer = call_ollama(prompt, prefer_local=st.session_state.use_local)
+                status.update(label="Response ready!", state="complete", expanded=False)
+
+            st.session_state.history.append({"user": user_input, "assistant": answer})
+            st.session_state.chat_processing = False
+            st.rerun()
 
     # --- Analysis ---
     with tabs[2]:
@@ -899,7 +1098,7 @@ def main():
             combined["category"] = combined.get("category", "Uncategorized").fillna("Uncategorized")
             
             # Time-based filtering
-            st.subheader("⏰ Filter by Time Period")
+            section_header("⏰ Filter by Time Period")
             col1, col2, col3 = st.columns(3)
             with col1:
                 period = st.selectbox("Select period:", ["Daily", "Monthly", "Yearly", "All"], key="period_select")
@@ -941,7 +1140,7 @@ def main():
                 st.stop()
             
             # --- Summary Metrics Row 1 ---
-            st.subheader("📈 Summary Metrics")
+            section_header("📈 Summary Metrics")
             metric_cols = st.columns(4)
             
             total_debit = filtered[filtered["txn_type"] == "Debit"]["amount"].sum()
@@ -952,16 +1151,16 @@ def main():
             tracked_count = int((filtered["status"] == "Tracked").sum())
             
             with metric_cols[0]:
-                st.metric("Total Debits", f"₹{total_debit:.2f}" if total_debit > 0 else "₹0.00", delta=None)
+                metric_card("Total Debits", f"₹{total_debit:.2f}" if total_debit > 0 else "₹0.00", "mc-red")
             with metric_cols[1]:
-                st.metric("Total Credits", f"₹{total_credit:.2f}" if total_credit > 0 else "₹0.00", delta=None)
+                metric_card("Total Credits", f"₹{total_credit:.2f}" if total_credit > 0 else "₹0.00", "mc-green")
             with metric_cols[2]:
-                st.metric("Net (Credits - Debits)", f"₹{net:.2f}", delta=None)
+                metric_card("Net (Credits - Debits)", f"₹{net:.2f}", "mc-blue")
             with metric_cols[3]:
-                st.metric("Tracked / Untracked", f"{tracked_count} / {untracked_count}", delta=None)
+                metric_card("Tracked / Untracked", f"{tracked_count} / {untracked_count}", "mc-purple")
             
             # --- Debit vs Credit Comparison ---
-            st.subheader("💳 Debit vs Credit Breakdown")
+            section_header("💳 Debit vs Credit Breakdown")
             debit_credit = filtered.groupby("txn_type")["amount"].sum()
             col1, col2 = st.columns(2)
             with col1:
@@ -970,7 +1169,7 @@ def main():
                 st.write(debit_credit.to_frame().rename(columns={"amount": "Total Amount"}))
             
             # --- Category-wise Breakdown ---
-            st.subheader("🏷️ Spending by Category")
+            section_header("🏷️ Spending by Category")
             if not filtered["category"].empty:
                 cat_summary = filtered.groupby("category")["amount"].agg(["sum", "count"]).sort_values("sum", ascending=False)
                 col1, col2 = st.columns(2)
@@ -992,7 +1191,7 @@ def main():
                 st.pyplot(fig)
             
             # --- Merchant-wise Breakdown ---
-            st.subheader("🏪 Spending by Merchant/Vendor")
+            section_header("🏪 Spending by Merchant/Vendor")
             merchant_summary = filtered.groupby("merchant")["amount"].agg(["sum", "count"]).sort_values("sum", ascending=False)
             st.write("**Top Merchants:**")
             st.dataframe(merchant_summary.head(15))
@@ -1002,20 +1201,23 @@ def main():
                 st.bar_chart(merchant_summary["sum"].head(10))
             
             # --- Transaction Trend Over Time ---
-            st.subheader("📉 Transaction Trends")
+            section_header("📉 Transaction Trends")
             if "timestamp" in combined.columns and not combined["timestamp"].isna().all():
                 daily_trend = filtered.groupby(filtered["timestamp"].dt.date)["amount"].sum()
                 st.line_chart(daily_trend)
             
             # --- Detailed Transaction Table ---
-            st.subheader("📋 All Transactions")
+            section_header("📋 All Transactions")
             display_cols = ["timestamp", "raw_text", "amount", "category", "merchant", "txn_type", "status"]
             available_display_cols = [c for c in display_cols if c in filtered.columns]
             st.dataframe(filtered[available_display_cols].sort_values("timestamp", ascending=False))
             
             # --- LLM-based Insights ---
-            st.subheader("🤖 AI-Powered Insights")
-            if st.button("Generate LLM Analysis"):
+            section_header("🤖 AI-Powered Insights")
+            gcols = st.columns([3, 2, 3])
+            with gcols[1]:
+                gen_clicked = st.button("Generate LLM Analysis", type="primary", use_container_width=True)
+            if gen_clicked:
                 # Prepare serializable sample rows
                 sample_df = filtered.tail(30).copy()
                 # Convert all Timestamp/datetime objects to strings
