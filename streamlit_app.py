@@ -2155,22 +2155,29 @@ def main():
             
             # --- LLM-based Insights ---
             section_header("🤖 AI-Powered Insights")
+
+            if "llm_insight" not in st.session_state:
+                st.session_state.llm_insight = None
+
             gcols = st.columns([3, 2, 3])
             with gcols[1]:
-                gen_clicked = st.button("Generate LLM Analysis", type="primary", use_container_width=True)
+                gen_clicked = st.button(
+                    "Generate LLM Analysis",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=st.session_state.llm_insight is not None,
+                )
+
             if gen_clicked:
-                # Prepare serializable sample rows
                 sample_df = filtered.tail(30).copy()
-                # Convert all Timestamp/datetime objects to strings
                 for col in sample_df.columns:
                     if pd.api.types.is_datetime64_any_dtype(sample_df[col]):
                         sample_df[col] = sample_df[col].astype(str)
                     elif col == "amount":
                         sample_df[col] = pd.to_numeric(sample_df[col], errors='coerce').fillna(0).astype(float)
-                
+
                 sample_rows = sample_df.to_dict(orient="records")
-                
-                # Prepare summary stats with all values JSON-serializable
+
                 summary_stats = {
                     "period": str(period),
                     "total_debits": float(total_debit) if not pd.isna(total_debit) else 0.0,
@@ -2180,7 +2187,7 @@ def main():
                     "top_categories": {str(k): float(v) for k, v in filtered.groupby("category")["amount"].sum().nlargest(5).to_dict().items()},
                     "top_merchants": {str(k): float(v) for k, v in filtered.groupby("merchant")["amount"].sum().nlargest(5).to_dict().items()}
                 }
-                
+
                 prompt = (
                     "You are a financial analyst. Analyze the following transaction data and provide actionable insights:\n\n"
                     f"Summary Stats: {json.dumps(summary_stats, ensure_ascii=False)}\n\n"
@@ -2192,8 +2199,15 @@ def main():
                     "4. Recommendations for expense management\n"
                     "5. Any unusual transactions or trends\n\n"
                     "Analysis:")
-                insight = call_ollama(prompt, prefer_local=st.session_state.use_local)
-                st.write(insight)
+                with st.spinner("Analyzing your transactions... This may take a moment."):
+                    insight = call_ollama(prompt, prefer_local=st.session_state.use_local)
+                st.session_state.llm_insight = insight
+
+            if st.session_state.llm_insight:
+                st.write(st.session_state.llm_insight)
+                if st.button("Clear", key="clear_llm"):
+                    st.session_state.llm_insight = None
+                    st.rerun()
 
 
 if __name__ == "__main__":
