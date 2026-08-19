@@ -12,8 +12,11 @@ from dotenv import load_dotenv
 BASE_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
+# Import the SMS parser
+from parse_transactions import parse_sms_text, export_to_excel, CURRENCY_DISPLAY
 
-RECORD_FILE = "records.xlsx"
+
+RECORD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "records.xlsx")
 
 # Comprehensive transaction categories
 TRANSACTION_CATEGORIES = {
@@ -279,32 +282,51 @@ def call_ollama(prompt: str, model: str = "pi", prefer_local: bool = True) -> st
     api_base = os.getenv("OLLAMA_API") if prefer_local else None
     cloud_base = os.getenv("OLLAMA_CLOUD_BASE_URL")
     cloud_key = os.getenv("OLLAMA_CLOUD_API_KEY")
+
+    def _try_local():
+        base = api_base.rstrip("/")
+        url = f"{base}/api/generate"
+        local_model = os.getenv("OLLAMA_LOCAL_MODEL", model)
+        payload = {"model": local_model, "prompt": prompt}
+        resp = requests.post(url, json=payload, timeout=60)
+        resp.raise_for_status()
+        return resp
+
+    def _try_cloud():
+        base = cloud_base.rstrip("/")
+        url = f"{base}/api/generate"
+        headers = {"Authorization": f"Bearer {cloud_key}", "Content-Type": "application/json"}
+        payload = {"model": os.getenv("OLLAMA_CLOUD_MODEL", model), "prompt": prompt}
+        resp = requests.post(url, json=payload, headers=headers, timeout=60)
+        resp.raise_for_status()
+        return resp
+
     try:
+        resp = None
         if api_base and prefer_local:
-            # Use local Ollama endpoint (preferred)
-            base = api_base.rstrip("/")
-            url = f"{base}/api/generate"
-            local_model = os.getenv("OLLAMA_LOCAL_MODEL", model)
-            payload = {"model": local_model, "prompt": prompt}
-            resp = requests.post(url, json=payload, timeout=60)
+            try:
+                resp = _try_local()
+            except requests.exceptions.HTTPError:
+                if cloud_base and cloud_key:
+                    resp = _try_cloud()
+                else:
+                    raise
         elif cloud_base and cloud_key:
-            # Use Ollama Cloud
-            base = cloud_base.rstrip("/")
-            url = f"{base}/api/generate"
-            headers = {"Authorization": f"Bearer {cloud_key}", "Content-Type": "application/json"}
-            payload = {"model": os.getenv("OLLAMA_CLOUD_MODEL", model), "prompt": prompt}
-            resp = requests.post(url, json=payload, headers=headers, timeout=60)
+            resp = _try_cloud()
         elif api_base:
-            # Fall back to local if cloud not available
-            base = api_base.rstrip("/")
-            url = f"{base}/api/generate"
-            local_model = os.getenv("OLLAMA_LOCAL_MODEL", model)
-            payload = {"model": local_model, "prompt": prompt}
-            resp = requests.post(url, json=payload, timeout=60)
+            try:
+                resp = _try_local()
+            except requests.exceptions.HTTPError:
+                if cloud_base and cloud_key:
+                    resp = _try_cloud()
+                else:
+                    raise
         else:
             raise ValueError("No Ollama endpoint configured (OLLAMA_API or OLLAMA_CLOUD_BASE_URL)")
 
-        resp.raise_for_status()
+        if resp is None:
+            raise ValueError("No Ollama endpoint responded successfully")
+
         # Handle both single JSON (local) and NDJSON streaming (cloud)
         try:
             data = resp.json()
@@ -490,8 +512,41 @@ def normalize_record(raw: str, parsed: dict) -> dict:
     merchant = parsed.get("merchant") or "Unknown"
     category = parsed.get("category") or "Uncategorized"
     description = parsed.get("description") or raw
-    currency = parsed.get("currency") or "INR"
+    currency = parsed.get("currency") or ""
     status = "Tracked" if amount is not None or date_value or merchant != "Unknown" or category != "Uncategorized" else "Untracked"
+
+    # Detect currency from raw SMS text if not provided by LLM
+    if not currency:
+        _cur_symbols = {
+            "£": "GBP", "$": "USD", "€": "EUR",
+            "₹": "INR", "AED": "AED", "د.إ": "AED",
+            "SAR": "SAR", "SGD": "SGD", "A$": "AUD",
+            "C$": "CAD", "¥": "JPY",
+        }
+        for sym, code in _cur_symbols.items():
+            if sym in raw:
+                currency = code
+                break
+        if not currency:
+            # Check text codes: INR, Rs., Rs, GBP, USD, EUR
+            _code_patterns = [
+                (r"\bINR\b", "INR"), (r"\bRs\.?\b", "INR"),
+                (r"\bGBP\b", "GBP"), (r"\bUSD\b", "USD"),
+                (r"\bEUR\b", "EUR"), (r"\bAED\b", "AED"),
+                (r"\bSAR\b", "SAR"), (r"\bSGD\b", "SGD"),
+                (r"\bAUD\b", "AUD"), (r"\bCAD\b", "CAD"),
+            ]
+            for pat, code in _code_patterns:
+                if re.search(pat, raw, re.I):
+                    currency = code
+                    break
+    if not currency:
+        currency = "INR"
+
+    # Build currency symbol for raw_text display
+    _cur_sym = {"INR": "Rs.", "GBP": "£", "USD": "$", "EUR": "€",
+                "AED": "AED", "SAR": "SAR", "SGD": "S$", "AUD": "A$", "CAD": "C$", "JPY": "¥"}
+    _sym = _cur_sym.get(currency, "Rs.")
 
     # For raw text like "SBI Alert: International Card transaction USD 125.00 (INR 10,875.00)"
     if amount is None:
@@ -543,12 +598,12 @@ def save_records_to_excel(tracked_df: pd.DataFrame, untracked_df: pd.DataFrame):
     if tracked_df.empty and untracked_df.empty:
         return
 
-    # Create workbook if it does not exist, otherwise open existing file.
+    from openpyxl import Workbook, load_workbook
+
+    # Load existing workbook or create new one
     if not os.path.exists(RECORD_FILE):
-        from openpyxl import Workbook
         wb = Workbook()
     else:
-        from openpyxl import load_workbook
         wb = load_workbook(RECORD_FILE)
 
     for sheet_name, df in [("Transactions", tracked_df), ("Untracked", untracked_df)]:
@@ -559,11 +614,58 @@ def save_records_to_excel(tracked_df: pd.DataFrame, untracked_df: pd.DataFrame):
         else:
             ws = wb.create_sheet(sheet_name)
 
-        if ws.max_row == 1 and ws["A1"].value is None:
+        # Load existing rows to deduplicate
+        existing_keys = set()
+        header_cols_lower = {c.lower() for c in df.columns}
+        if ws.max_row > 1 or (ws.max_row == 1 and ws["A1"].value is not None):
+            for row_cells in ws.iter_rows(min_row=2, values_only=True):
+                row_vals = list(row_cells)
+                # Skip any stale duplicate header row
+                if row_vals and str(row_vals[0] or "").lower() in header_cols_lower:
+                    continue
+                # Build dedup key from: date(idx 3), amount(idx 4), merchant(idx 6), category(idx 7)
+                key = (
+                    str(row_vals[3] if len(row_vals) > 3 else ""),
+                    str(row_vals[4] if len(row_vals) > 4 else ""),
+                    str(row_vals[6] if len(row_vals) > 6 else ""),
+                    str(row_vals[7] if len(row_vals) > 7 else ""),
+                )
+                existing_keys.add(key)
+
+        # Write header if sheet has no header.
+        # Handle two cases:
+        #   1) Row 1 has header → already fine
+        #   2) Row 1 empty, Row 2 has header (openpyxl quirk) → move header to Row 1
+        #   3) No header at all → append one
+        header_row1 = [c.value for c in ws[1]]
+        header_row2 = [c.value for c in ws[2]] if ws.max_row >= 2 else []
+        has_r1_header = any(v is not None for v in header_row1)
+        has_r2_header = any(v is not None for v in header_row2)
+
+        if has_r1_header:
+            pass  # header already in correct place
+        elif has_r2_header and not has_r1_header:
+            # Row 1 is empty openpyxl default; move Row 2 header into Row 1
+            for col_idx, val in enumerate(header_row2, 1):
+                ws.cell(row=1, column=col_idx, value=val)
+            ws.delete_rows(2, 1)
+        elif not has_r1_header and not has_r2_header:
             ws.append(list(df.columns))
-        # append rows
+
+        # Append only new (non-duplicate) rows
+        new_count = 0
         for _, row in df.iterrows():
-            ws.append([row.get(col) for col in df.columns])
+            vals = [row.get(col) for col in df.columns]
+            key = (
+                str(vals[3] if len(vals) > 3 else ""),
+                str(vals[4] if len(vals) > 4 else ""),
+                str(vals[6] if len(vals) > 6 else ""),
+                str(vals[7] if len(vals) > 7 else ""),
+            )
+            if key not in existing_keys:
+                ws.append(vals)
+                existing_keys.add(key)
+                new_count += 1
 
     wb.save(RECORD_FILE)
 
@@ -582,48 +684,45 @@ def load_records() -> pd.DataFrame:
         return pd.DataFrame(columns=default_columns)
 
     frames = []
-    try:
-        tracked = pd.read_excel(RECORD_FILE, sheet_name="Transactions", engine="openpyxl")
-        # Handle Excel files where the header row was written as the first data row
-        # (common when appending without proper header handling). Detect if the
-        # first row contains the expected column names and promote it to header.
+    for sheet_name, fill_status in [("Transactions", "Tracked"), ("Untracked", "Untracked")]:
         try:
-            if any(str(c).startswith("Unnamed") for c in tracked.columns):
-                first_row_vals = tracked.iloc[0].astype(str).tolist()
-                first_row_lc = [v.strip().lower() for v in first_row_vals]
-                expected_lc = [c.lower() for c in default_columns]
-                if set(expected_lc).issubset(set(first_row_lc)):
-                    # promote first row to header
-                    tracked.columns = [v.strip() for v in first_row_vals]
-                    tracked = tracked.drop(tracked.index[0]).reset_index(drop=True)
+            df = pd.read_excel(RECORD_FILE, sheet_name=sheet_name, engine="openpyxl")
         except Exception:
-            pass
+            continue
+
+        # Fix broken headers: when header row was written as data (row 1 = all None),
+        # pandas creates "Unnamed: 0" columns and the actual header becomes row 0 data.
+        needs_header_fix = any(str(c).startswith("Unnamed") for c in df.columns)
+        if needs_header_fix and len(df) > 0:
+            first_row = [str(v).strip() for v in df.iloc[0].tolist()]
+            # Check if the first data row looks like column names
+            if any(v.lower() in {"timestamp", "raw_text", "parsed", "date", "amount",
+                                  "currency", "merchant", "category", "description", "status"}
+                   for v in first_row):
+                df.columns = first_row
+                df = df.iloc[1:].reset_index(drop=True)
+
+        # Also handle case where row 1 is all-None (openpyxl default empty row)
+        # which causes pandas to use auto-generated headers
+        if needs_header_fix and len(df) > 0:
+            # Check if the current "first row" IS the header row (all values are column-like)
+            first_row_vals = [str(v).strip().lower() for v in df.iloc[0].tolist()]
+            col_names_lower = [c.lower() for c in df.columns]
+            # If the first data row matches expected columns, it's actually the header
+            match_count = sum(1 for v in first_row_vals if v in {"timestamp", "raw_text", "parsed",
+                               "date", "amount", "currency", "merchant", "category",
+                               "description", "status"})
+            if match_count >= 5:
+                df.columns = [str(v).strip() for v in df.iloc[0].tolist()]
+                df = df.iloc[1:].reset_index(drop=True)
+
+        # Ensure all default columns exist
         for col in default_columns:
-            if col not in tracked.columns:
-                tracked[col] = None
-        tracked["status"] = tracked.get("status", "Tracked")
-        frames.append(tracked)
-    except Exception:
-        pass
-    try:
-        untracked = pd.read_excel(RECORD_FILE, sheet_name="Untracked", engine="openpyxl")
-        try:
-            if any(str(c).startswith("Unnamed") for c in untracked.columns):
-                first_row_vals = untracked.iloc[0].astype(str).tolist()
-                first_row_lc = [v.strip().lower() for v in first_row_vals]
-                expected_lc = [c.lower() for c in default_columns]
-                if set(expected_lc).issubset(set(first_row_lc)):
-                    untracked.columns = [v.strip() for v in first_row_vals]
-                    untracked = untracked.drop(untracked.index[0]).reset_index(drop=True)
-        except Exception:
-            pass
-        for col in default_columns:
-            if col not in untracked.columns:
-                untracked[col] = None
-        untracked["status"] = untracked.get("status", "Untracked")
-        frames.append(untracked)
-    except Exception:
-        pass
+            if col not in df.columns:
+                df[col] = None
+        df["status"] = df.get("status", fill_status)
+        frames.append(df)
+
     if not frames:
         return pd.DataFrame(columns=default_columns)
     combined = pd.concat(frames, ignore_index=True)
@@ -885,7 +984,7 @@ def main():
         cloud_key = os.getenv("OLLAMA_CLOUD_API_KEY")
 
         if "use_local" not in st.session_state:
-            st.session_state.use_local = False if (cloud_base and cloud_key) else (True if api_base else False)
+            st.session_state.use_local = True if api_base else (False if (cloud_base and cloud_key) else False)
 
         # ── Model Selector (compact, top of sidebar) ──
         available_endpoints = []
@@ -925,7 +1024,11 @@ def main():
         if _sdf.empty:
             st.info("No transactions yet. Add some to see analytics here.")
         else:
-            # build a small combined frame for stats
+            # Currency symbol map
+            _csym = {"INR": "\u20b9", "GBP": "\u00a3", "USD": "$", "EUR": "\u20ac",
+                     "AED": "AED", "SAR": "SAR", "SGD": "S$", "AUD": "A$", "CAD": "C$", "JPY": "\u00a5"}
+
+            # Build combined frame — always use currency from _sdf (the source of truth)
             def _safe_json(x):
                 if isinstance(x, dict): return x
                 if isinstance(x, str) and x.strip():
@@ -937,14 +1040,20 @@ def main():
 
             _parsed = _sdf["parsed"].apply(_safe_json) if "parsed" in _sdf.columns else pd.Series([{}]*len(_sdf))
             _p_df = pd.json_normalize(_parsed.fillna({}).tolist(), errors="ignore") if len(_parsed) else pd.DataFrame()
-            for c in ["amount", "date", "merchant", "category", "status", "currency"]:
+            for c in ["amount", "date", "merchant", "category", "status"]:
                 if c not in _p_df.columns:
                     _p_df[c] = _sdf[c].values if c in _sdf.columns else None
+            # Drop currency from parsed JSON — always use _sdf (source of truth)
+            if "currency" in _p_df.columns:
+                _p_df = _p_df.drop(columns=["currency"])
+            _p_df["currency"] = _sdf["currency"].values if "currency" in _sdf.columns else "INR"
+            _p_df["currency"] = _p_df["currency"].fillna("INR").str.upper().str.strip()
             _p_df["amount"] = pd.to_numeric(_p_df["amount"], errors="coerce")
             if "date" in _p_df.columns:
                 _p_df["date"] = pd.to_datetime(_p_df["date"], errors="coerce", dayfirst=True)
-            _p_df["merchant"] = _p_df["merchant"].fillna("Unknown")
+            _p_df["merchant"] = _p_df["merchant"].fillna("Unknown").str.strip()
             _p_df["category"] = _p_df["category"].fillna("Uncategorized")
+            _p_df["currency"] = _p_df["currency"].fillna("INR")
 
             # classify debit / credit
             def _cls(row):
@@ -956,109 +1065,134 @@ def main():
                 return "Unknown"
             _p_df["txn_type"] = _p_df.apply(_cls, axis=1) if len(_p_df) else pd.Series(dtype=str)
 
-            _total_spend = _p_df.loc[_p_df["txn_type"] == "Debit", "amount"].sum()
-            _total_income = _p_df.loc[_p_df["txn_type"] == "Credit", "amount"].sum()
-            _txn_count = len(_p_df)
-            _net = _total_income - _total_spend
-
-            # ── Summary cards ──
             def _scard(label, value, css):
                 return f'<div class="side-stat {css}"><div class="s-label">{label}</div><div class="s-value">{value}</div></div>'
 
-            st.markdown(_scard("Total Spent", f"₹{_total_spend:,.0f}", "ss-red"), unsafe_allow_html=True)
-            st.markdown(_scard("Total Received", f"₹{_total_income:,.0f}", "ss-green"), unsafe_allow_html=True)
-            st.markdown(_scard("Net", f"₹{_net:,.0f}", "ss-blue"), unsafe_allow_html=True)
-            st.markdown(_scard("Transactions", str(_txn_count), "ss-purple"), unsafe_allow_html=True)
+            # ── Per-currency summary cards ──
+            _currencies = sorted(_p_df["currency"].dropna().unique().tolist())
+            for _cur in _currencies:
+                _cdf = _p_df[_p_df["currency"] == _cur]
+                _sym = _csym.get(_cur, _cur + " ")
+                _spend = _cdf.loc[_cdf["txn_type"] == "Debit", "amount"].sum()
+                _income = _cdf.loc[_cdf["txn_type"] == "Credit", "amount"].sum()
+                _count = len(_cdf)
+                _net = _income - _spend
 
-            # ── Top spending categories ──
+                st.markdown(f'<div style="font-size:0.78rem;font-weight:700;color:#1a237e;margin-top:0.5rem;">{_cur} ({_sym.strip()})</div>', unsafe_allow_html=True)
+                st.markdown(_scard("Spent", f"{_sym}{_spend:,.0f}", "ss-red"), unsafe_allow_html=True)
+                st.markdown(_scard("Received", f"{_sym}{_income:,.0f}", "ss-green"), unsafe_allow_html=True)
+                st.markdown(_scard("Net", f"{_sym}{_net:,.0f}", "ss-blue"), unsafe_allow_html=True)
+                st.markdown(_scard("Transactions", str(_count), "ss-purple"), unsafe_allow_html=True)
+
+            # ── Top spending categories (per currency) ──
             _debits = _p_df.loc[_p_df["txn_type"] == "Debit"]
             if not _debits.empty and "category" in _debits.columns:
-                st.markdown('<hr class="side-divider">', unsafe_allow_html=True)
-                st.markdown('<div class="side-section-title">Top Spending Categories</div>', unsafe_allow_html=True)
-                _cat = _debits.groupby("category")["amount"].sum().sort_values(ascending=False).head(5)
-                _max_cat = _cat.max() if len(_cat) else 1
-                for _cat_name, _cat_val in _cat.items():
-                    _pct = int((_cat_val / _max_cat) * 100) if _max_cat else 0
-                    st.markdown(
-                        f'<div style="margin-bottom:0.35rem;">'
-                        f'<div style="font-size:0.78rem;color:#444;font-weight:600;">{_cat_name}</div>'
-                        f'<div style="background:#e8eaf6;border-radius:4px;height:8px;">'
-                        f'<div style="background:linear-gradient(90deg,#3949ab,#5c6bc0);width:{_pct}%;height:100%;border-radius:4px;"></div></div>'
-                        f'<div style="font-size:0.72rem;color:#888;">₹{_cat_val:,.0f}</div></div>',
-                        unsafe_allow_html=True,
-                    )
+                for _cur in _currencies:
+                    _cur_debits = _debits[_debits["currency"] == _cur]
+                    if _cur_debits.empty:
+                        continue
+                    _sym = _csym.get(_cur, _cur + " ")
+                    st.markdown('<hr class="side-divider">', unsafe_allow_html=True)
+                    st.markdown(f'<div class="side-section-title">Top Categories ({_cur})</div>', unsafe_allow_html=True)
+                    _cat = _cur_debits.groupby("category")["amount"].sum().sort_values(ascending=False).head(5)
+                    _max_cat = _cat.max() if len(_cat) else 1
+                    for _cat_name, _cat_val in _cat.items():
+                        _pct = int((_cat_val / _max_cat) * 100) if _max_cat else 0
+                        st.markdown(
+                            f'<div style="margin-bottom:0.35rem;">'
+                            f'<div style="font-size:0.78rem;color:#444;font-weight:600;">{_cat_name}</div>'
+                            f'<div style="background:#e8eaf6;border-radius:4px;height:8px;">'
+                            f'<div style="background:linear-gradient(90deg,#3949ab,#5c6bc0);width:{_pct}%;height:100%;border-radius:4px;"></div></div>'
+                            f'<div style="font-size:0.72rem;color:#888;">{_sym}{_cat_val:,.0f}</div></div>',
+                            unsafe_allow_html=True,
+                        )
 
-            # ── Top merchants ──
+            # ── Top merchants (per currency) ──
             if not _debits.empty and "merchant" in _debits.columns:
-                st.markdown('<hr class="side-divider">', unsafe_allow_html=True)
-                st.markdown('<div class="side-section-title">Top Merchants</div>', unsafe_allow_html=True)
-                _merch = _debits.groupby("merchant")["amount"].sum().sort_values(ascending=False).head(5)
-                _max_m = _merch.max() if len(_merch) else 1
-                for _m_name, _m_val in _merch.items():
-                    _pct = int((_m_val / _max_m) * 100) if _max_m else 0
-                    st.markdown(
-                        f'<div style="margin-bottom:0.35rem;">'
-                        f'<div style="font-size:0.78rem;color:#444;font-weight:600;">{_m_name}</div>'
-                        f'<div style="background:#e8f5e9;border-radius:4px;height:8px;">'
-                        f'<div style="background:linear-gradient(90deg,#2e7d32,#66bb6a);width:{_pct}%;height:100%;border-radius:4px;"></div></div>'
-                        f'<div style="font-size:0.72rem;color:#888;">₹{_m_val:,.0f}</div></div>',
-                        unsafe_allow_html=True,
-                    )
+                for _cur in _currencies:
+                    _cur_debits = _debits[_debits["currency"] == _cur]
+                    if _cur_debits.empty:
+                        continue
+                    _sym = _csym.get(_cur, _cur + " ")
+                    st.markdown('<hr class="side-divider">', unsafe_allow_html=True)
+                    st.markdown(f'<div class="side-section-title">Top Merchants ({_cur})</div>', unsafe_allow_html=True)
+                    _merch = _cur_debits.groupby("merchant")["amount"].sum().sort_values(ascending=False).head(5)
+                    _max_m = _merch.max() if len(_merch) else 1
+                    for _m_name, _m_val in _merch.items():
+                        _pct = int((_m_val / _max_m) * 100) if _max_m else 0
+                        st.markdown(
+                            f'<div style="margin-bottom:0.35rem;">'
+                            f'<div style="font-size:0.78rem;color:#444;font-weight:600;">{_m_name}</div>'
+                            f'<div style="background:#e8f5e9;border-radius:4px;height:8px;">'
+                            f'<div style="background:linear-gradient(90deg,#2e7d32,#66bb6a);width:{_pct}%;height:100%;border-radius:4px;"></div></div>'
+                            f'<div style="font-size:0.72rem;color:#888;">{_sym}{_m_val:,.0f}</div></div>',
+                            unsafe_allow_html=True,
+                        )
 
-            # ── Monthly spending mini chart ──
+            # ── Monthly spending mini chart (per currency) ──
             if "date" in _p_df.columns and not _p_df["date"].isna().all() and not _debits.empty:
-                st.markdown('<hr class="side-divider">', unsafe_allow_html=True)
-                st.markdown('<div class="side-section-title">Monthly Spending</div>', unsafe_allow_html=True)
-                _monthly = _debits.copy()
-                _monthly["month"] = _monthly["date"].dt.to_period("M")
-                _m_spend = _monthly.groupby("month")["amount"].sum().sort_index().tail(6)
-                _max_ms = _m_spend.max() if len(_m_spend) else 1
-                for _m_label, _m_val in _m_spend.items():
-                    _pct = int((_m_val / _max_ms) * 100) if _max_ms else 0
-                    _bar_color = "#c62828" if _pct > 80 else "#e65100" if _pct > 50 else "#2e7d32"
-                    st.markdown(
-                        f'<div style="margin-bottom:0.35rem;">'
-                        f'<div style="font-size:0.78rem;color:#444;font-weight:600;">{str(_m_label)}</div>'
-                        f'<div style="background:#fce4ec;border-radius:4px;height:8px;">'
-                        f'<div style="background:{_bar_color};width:{_pct}%;height:100%;border-radius:4px;"></div></div>'
-                        f'<div style="font-size:0.72rem;color:#888;">₹{_m_val:,.0f}</div></div>',
-                        unsafe_allow_html=True,
-                    )
+                for _cur in _currencies:
+                    _cur_debits = _debits[_debits["currency"] == _cur]
+                    if _cur_debits.empty:
+                        continue
+                    _sym = _csym.get(_cur, _cur + " ")
+                    st.markdown('<hr class="side-divider">', unsafe_allow_html=True)
+                    st.markdown(f'<div class="side-section-title">Monthly Spending ({_cur})</div>', unsafe_allow_html=True)
+                    _monthly = _cur_debits.copy()
+                    _monthly["month"] = _monthly["date"].dt.to_period("M")
+                    _m_spend = _monthly.groupby("month")["amount"].sum().sort_index().tail(6)
+                    _max_ms = _m_spend.max() if len(_m_spend) else 1
+                    for _m_label, _m_val in _m_spend.items():
+                        _pct = int((_m_val / _max_ms) * 100) if _max_ms else 0
+                        _bar_color = "#c62828" if _pct > 80 else "#e65100" if _pct > 50 else "#2e7d32"
+                        st.markdown(
+                            f'<div style="margin-bottom:0.35rem;">'
+                            f'<div style="font-size:0.78rem;color:#444;font-weight:600;">{str(_m_label)}</div>'
+                            f'<div style="background:#fce4ec;border-radius:4px;height:8px;">'
+                            f'<div style="background:{_bar_color};width:{_pct}%;height:100%;border-radius:4px;"></div></div>'
+                            f'<div style="font-size:0.72rem;color:#888;">{_sym}{_m_val:,.0f}</div></div>',
+                            unsafe_allow_html=True,
+                        )
 
-            # ── Fun story / insights ──
+            # ── Spending story (per currency) ──
             if not _debits.empty:
-                st.markdown('<hr class="side-divider">', unsafe_allow_html=True)
-                st.markdown('<div class="side-section-title">Spending Story</div>', unsafe_allow_html=True)
-                _top_cat = _debits.groupby("category")["amount"].idxmax()
-                _top_cat_name = _debits.loc[_top_cat.iloc[0], "category"] if len(_top_cat) else "N/A"
-                _food = _debits[_debits["category"].str.contains("Food|Restaurant|Cafe|Swiggy|Zomato", case=False, na=False)]
-                _travel = _debits[_debits["category"].str.contains("Fuel|Taxi|Uber|Ola|Flight|Hotel|Train", case=False, na=False)]
-                _ent = _debits[_debits["category"].str.contains("Movie|OTT|Gaming|Music|Sports|Event", case=False, na=False)]
-                _food_total = _food["amount"].sum()
-                _travel_total = _travel["amount"].sum()
-                _ent_total = _ent["amount"].sum()
-                _total_all = _debits["amount"].sum() or 1
+                for _cur in _currencies:
+                    _cur_debits = _debits[_debits["currency"] == _cur]
+                    if _cur_debits.empty:
+                        continue
+                    _sym = _csym.get(_cur, _cur + " ")
+                    st.markdown('<hr class="side-divider">', unsafe_allow_html=True)
+                    st.markdown(f'<div class="side-section-title">Spending Story ({_cur})</div>', unsafe_allow_html=True)
+                    _top_cat = _cur_debits.groupby("category")["amount"].idxmax()
+                    _top_cat_name = _cur_debits.loc[_top_cat.iloc[0], "category"] if len(_top_cat) else "N/A"
+                    _food = _cur_debits[_cur_debits["category"].str.contains("Food|Restaurant|Cafe|Swiggy|Zomato", case=False, na=False)]
+                    _travel = _cur_debits[_cur_debits["category"].str.contains("Fuel|Taxi|Uber|Ola|Flight|Hotel|Train", case=False, na=False)]
+                    _ent = _cur_debits[_cur_debits["category"].str.contains("Movie|OTT|Gaming|Music|Sports|Event", case=False, na=False)]
+                    _food_total = _food["amount"].sum()
+                    _travel_total = _travel["amount"].sum()
+                    _ent_total = _ent["amount"].sum()
+                    _total_all = _cur_debits["amount"].sum() or 1
 
-                _story_parts = []
-                _story_parts.append(f"Your biggest spending bucket is <b>{_top_cat_name}</b>.")
-                if _food_total > 0:
-                    _p = int((_food_total / _total_all) * 100)
-                    _story_parts.append(f"Food & dining eats up <b>{_p}%</b> of your wallet — ₹{_food_total:,.0f}{'  Time to cook more?' if _p > 20 else ''}")
-                if _travel_total > 0:
-                    _p = int((_travel_total / _total_all) * 100)
-                    _story_parts.append(f"Travel & fuel cost <b>{_p}%</b> — ₹{_travel_total:,.0f}{'  Roads are expensive!' if _p > 15 else ''}")
-                if _ent_total > 0:
-                    _p = int((_ent_total / _total_all) * 100)
-                    _story_parts.append(f"Entertainment spend: <b>{_p}%</b> — ₹{_ent_total:,.0f}{'  Netflix binges showing up here?' if _p > 10 else ''}")
+                    _story_parts = []
+                    _story_parts.append(f"Your biggest spending bucket is <b>{_top_cat_name}</b>.")
+                    if _food_total > 0:
+                        _p = int((_food_total / _total_all) * 100)
+                        _story_parts.append(f"Food & dining eats up <b>{_p}%</b> of your wallet \u2014 {_sym}{_food_total:,.0f}{'  Time to cook more?' if _p > 20 else ''}")
+                    if _travel_total > 0:
+                        _p = int((_travel_total / _total_all) * 100)
+                        _story_parts.append(f"Travel & fuel cost <b>{_p}%</b> \u2014 {_sym}{_travel_total:,.0f}{'  Roads are expensive!' if _p > 15 else ''}")
+                    if _ent_total > 0:
+                        _p = int((_ent_total / _total_all) * 100)
+                        _story_parts.append(f"Entertainment spend: <b>{_p}%</b> \u2014 {_sym}{_ent_total:,.0f}{'  Netflix binges showing up here?' if _p > 10 else ''}")
 
-                _avg_txn = _debits["amount"].mean()
-                _story_parts.append(f"Average transaction: <b>₹{_avg_txn:,.0f}</b>.")
+                    _avg_txn = _cur_debits["amount"].mean()
+                    _story_parts.append(f"Average transaction: <b>{_sym}{_avg_txn:,.0f}</b>.")
 
-                for _s in _story_parts:
-                    st.markdown(
-                        f'<div style="font-size:0.78rem;color:#333;padding:0.2rem 0;">{_s}</div>',
-                        unsafe_allow_html=True,
-                    )
+                    for _s in _story_parts:
+                        st.markdown(
+                            f'<div style="font-size:0.78rem;color:#333;padding:0.2rem 0;">{_s}</div>',
+                            unsafe_allow_html=True,
+                        )
 
     selected_model = (
         os.getenv("OLLAMA_LOCAL_MODEL", "llama3.2:latest")
@@ -1073,6 +1207,76 @@ def main():
 
     # --- Input & Parse ---
     with tabs[0]:
+        st.subheader("Load from File")
+        uploaded_file = st.file_uploader(
+            "Upload SMS text file (.txt)",
+            type=["txt"],
+            help="Upload a .txt file exported from your phone. Supports HDFC, ICICI, SBI, Standard Chartered, and any Indian bank.",
+        )
+
+        if uploaded_file is not None:
+            file_text = uploaded_file.read().decode("utf-8", errors="replace")
+            st.info(f"File loaded: {uploaded_file.name} ({len(file_text):,} chars)")
+
+            if st.button("Parse File", type="primary", key="parse_file_btn"):
+                with st.spinner("Parsing transactions..."):
+                    txns = parse_sms_text(file_text)
+
+                if not txns:
+                    st.warning("No transactions found in the file.")
+                else:
+                    st.success(f"Parsed {len(txns)} transactions")
+
+                    # Convert to DataFrame for display
+                    txn_data = []
+                    for t in txns:
+                        txn_data.append({
+                            "Date": t.date,
+                            "Type": t.txn_type,
+                            "Amount": t.amount,
+                            "Currency": t.currency or "INR",
+                            "Category": t.category,
+                            "Merchant": t.merchant,
+                            "Bank": t.bank,
+                            "Card / Account": t.card or t.detail,
+                            "Ref": t.ref,
+                        })
+                    txn_df = pd.DataFrame(txn_data)
+                    st.dataframe(txn_df, use_container_width=True)
+
+                    # Save directly into records.xlsx
+                    try:
+                        _sym = {"INR": "Rs.", "GBP": "\u00a3", "USD": "$", "EUR": "\u20ac",
+                                "AED": "AED", "SAR": "SAR", "SGD": "S$", "AUD": "A$", "CAD": "C$", "JPY": "\u00a5"}
+                        new_records = []
+                        for _, row in txn_df.iterrows():
+                            cur = row.get("Currency", "INR")
+                            sym = _sym.get(cur, "Rs.")
+                            new_records.append({
+                                "timestamp": datetime.datetime.utcnow().isoformat(),
+                                "raw_text": f"{row['Type']} {sym}{row['Amount']} {row['Merchant']} {row['Bank']}",
+                                "parsed": json.dumps({
+                                    "date": row["Date"], "amount": row["Amount"],
+                                    "currency": cur, "merchant": row["Merchant"],
+                                    "category": row["Category"], "bank": row["Bank"],
+                                    "card": row["Card / Account"],
+                                }),
+                                "date": row["Date"],
+                                "amount": row["Amount"],
+                                "currency": cur,
+                                "merchant": row["Merchant"],
+                                "category": row["Category"],
+                                "description": f"{row['Type']} {sym}{row['Amount']} {row['Merchant']}",
+                                "status": "Tracked",
+                            })
+                        new_df = pd.DataFrame(new_records)
+                        save_records_to_excel(new_df, pd.DataFrame())
+                        st.success(f"Saved {len(txn_df)} transactions directly into records.xlsx")
+                    except Exception as e:
+                        st.warning(f"Could not save to records.xlsx: {e}")
+
+        st.markdown("---")
+
         raw = st.text_area(
             "Paste one or more SMS / bank transaction texts",
             height=150,
@@ -1135,9 +1339,14 @@ def main():
 
             _sp = _sdf["parsed"].apply(_sj) if "parsed" in _sdf.columns else pd.Series([{}]*len(_sdf))
             _spdf = pd.json_normalize(_sp.fillna({}).tolist(), errors="ignore") if len(_sp) else pd.DataFrame()
-            for c in ["amount", "date", "merchant", "category", "currency", "raw_text"]:
+            for c in ["amount", "date", "merchant", "category", "raw_text"]:
                 if c not in _spdf.columns:
                     _spdf[c] = _sdf[c].values if c in _sdf.columns else None
+            # Always use currency from _sdf (source of truth), drop any from LLM parsed JSON
+            if "currency" in _spdf.columns:
+                _spdf = _spdf.drop(columns=["currency"])
+            _spdf["currency"] = _sdf["currency"].values if "currency" in _sdf.columns else "INR"
+            _spdf["currency"] = _spdf["currency"].fillna("INR")
             _spdf["amount"] = pd.to_numeric(_spdf["amount"], errors="coerce")
             if "date" in _spdf.columns:
                 _spdf["date"] = _spdf["date"].astype(str).str.replace(r"\s*(IST|UTC|GMT|PST|EST|CST|MST)\s*$", "", regex=True, flags=re.I)
@@ -1151,6 +1360,9 @@ def main():
                 _month_df = _spdf[_spdf["date"].dt.to_period("M") == cur_month].copy()
             else:
                 _month_df = _spdf.copy()
+
+            _csym = {"INR": "\u20b9", "GBP": "\u00a3", "USD": "$", "EUR": "\u20ac",
+                     "AED": "AED ", "SAR": "SAR ", "SGD": "S$", "AUD": "A$", "CAD": "C$", "JPY": "\u00a5"}
 
             if not _month_df.empty:
                 def _cls2(row):
@@ -1170,161 +1382,170 @@ def main():
                     return "Unknown"
                 _month_df["txn_type"] = _month_df.apply(_cls2, axis=1)
 
-                _debits = _month_df[_month_df["txn_type"] == "Debit"]
-                _credits = _month_df[_month_df["txn_type"] == "Credit"]
-                _total_spent = _debits["amount"].sum()
-                _total_recv = _credits["amount"].sum()
-                _total_all = _total_spent or 1
-                _txn_count = len(_debits)
-                _avg = _debits["amount"].mean() if _txn_count else 0
-                _max_txn = _debits["amount"].max() if _txn_count else 0
-                _max_merchant = _debits.loc[_debits["amount"].idxmax(), "merchant"] if _txn_count else "N/A"
-                _max_category = _debits.loc[_debits["amount"].idxmax(), "category"] if _txn_count else "N/A"
+                # Per-currency story
+                _currencies_story = sorted(_month_df["currency"].dropna().unique().tolist())
+                _all_story_html = ""
+                for _cur_story in _currencies_story:
+                    _sym = _csym.get(_cur_story, _cur_story + " ")
+                    _cur_month_df = _month_df[_month_df["currency"] == _cur_story].copy()
 
-                # category buckets
-                _food_kw = "Food|Restaurant|Cafe|Swiggy|Zomato|Fast Food|Bakery|Fine Dining"
-                _travel_kw = "Fuel|Diesel|Petrol|Taxi|Uber|Ola|Flight|Hotel|Train|Bus|Metro|Parking|FASTag"
-                _gadget_kw = "Amazon|Flipkart|Electronics|Mobile|Gadget|Gaming|Laptop|Apple|Samsung"
-                _ent_kw = "Movie|OTT|Netflix|Prime|Disney|Gaming|Music|Sports|Event|SonyLIV|JioCinema"
-                _health_kw = "Hospital|Doctor|Pharmacy|Medical|Health Insurance|Apollo|Fortis"
-                _shop_kw = "Supermarket|Department|Furniture|Jewelry|Fashion|Myntra|Ajio|Nykaa|Lifestyle"
-                _bills_kw = "Electricity|Water|Gas|Broadband|Mobile Recharge|DTH|Bill"
+                    _debits = _cur_month_df[_cur_month_df["txn_type"] == "Debit"]
+                    _credits = _cur_month_df[_cur_month_df["txn_type"] == "Credit"]
+                    _total_spent = _debits["amount"].sum()
+                    _total_recv = _credits["amount"].sum()
+                    _total_all = _total_spent or 1
+                    _txn_count = len(_debits)
+                    _avg = _debits["amount"].mean() if _txn_count else 0
+                    _max_txn = _debits["amount"].max() if _txn_count else 0
+                    _max_merchant = _debits.loc[_debits["amount"].idxmax(), "merchant"] if _txn_count else "N/A"
+                    _max_category = _debits.loc[_debits["amount"].idxmax(), "category"] if _txn_count else "N/A"
 
-                def _cat_total(kw):
-                    m = _debits["category"].str.contains(kw, case=False, na=False) | _debits["merchant"].str.contains(kw, case=False, na=False)
-                    return _debits.loc[m, "amount"].sum()
+                    # category buckets
+                    _food_kw = "Food|Restaurant|Cafe|Swiggy|Zomato|Fast Food|Bakery|Fine Dining"
+                    _travel_kw = "Fuel|Diesel|Petrol|Taxi|Uber|Ola|Flight|Hotel|Train|Bus|Metro|Parking|FASTag"
+                    _gadget_kw = "Amazon|Flipkart|Electronics|Mobile|Gadget|Gaming|Laptop|Apple|Samsung"
+                    _ent_kw = "Movie|OTT|Netflix|Prime|Disney|Gaming|Music|Sports|Event|SonyLIV|JioCinema"
+                    _health_kw = "Hospital|Doctor|Pharmacy|Medical|Health Insurance|Apollo|Fortis"
+                    _shop_kw = "Supermarket|Department|Furniture|Jewelry|Fashion|Myntra|Ajio|Nykaa|Lifestyle"
+                    _bills_kw = "Electricity|Water|Gas|Broadband|Mobile Recharge|DTH|Bill"
 
-                _food_t = _cat_total(_food_kw)
-                _travel_t = _cat_total(_travel_kw)
-                _gadget_t = _cat_total(_gadget_kw)
-                _ent_t = _cat_total(_ent_kw)
-                _health_t = _cat_total(_health_kw)
-                _shop_t = _cat_total(_shop_kw)
-                _bills_t = _cat_total(_bills_kw)
+                    def _cat_total(kw, _d=_debits):
+                        m = _d["category"].str.contains(kw, case=False, na=False) | _d["merchant"].str.contains(kw, case=False, na=False)
+                        return _d.loc[m, "amount"].sum()
 
-                _month_label = cur_month.strftime("%B %Y")
+                    _food_t = _cat_total(_food_kw)
+                    _travel_t = _cat_total(_travel_kw)
+                    _gadget_t = _cat_total(_gadget_kw)
+                    _ent_t = _cat_total(_ent_kw)
+                    _health_t = _cat_total(_health_kw)
+                    _shop_t = _cat_total(_shop_kw)
+                    _bills_t = _cat_total(_bills_kw)
 
-                # ── Exaggerated dramatic storylines ──
-                _story_items = []
+                    _month_label = cur_month.strftime("%B %Y")
 
-                # Opening headline
-                if _total_spent > _total_recv and _total_recv > 0:
-                    _story_items.append(("🔥", f"<b>BREAKING:</b> Your wallet lost <span class='story-amount story-highlight'>₹{_total_spent:,.0f}</span> this month while only <span class='story-amount story-good'>₹{_total_recv:,.0f}</span> trickled back in. That's a <span class='story-highlight'>{((_total_spent/_total_recv - 1)*100):.0f}% overspend rate!</b>"))
-                elif _total_recv > 0:
-                    _story_items.append(("💰", f"<b>MIRACLE ALERT:</b> You somehow survived {_month_label} spending just <span class='story-amount'>₹{_total_spent:,.0f}</span> while raking in <span class='story-amount story-good'>₹{_total_recv:,.0f}</span>. Your bank account is throwing a party!"))
-                else:
-                    _story_items.append(("💸", f"<b>EMERGENCY BROADCAST:</b> <span class='story-amount story-highlight'>₹{_total_spent:,.0f}</span> vanished from your accounts in {_month_label}. No salary credits detected. Your money went on an adventure without you."))
+                    # ── Exaggerated dramatic storylines ──
+                    _story_items = []
 
-                # Biggest single hit
-                if _txn_count > 0:
-                    _story_items.append(("🎯", f"<b>BIGGEST HEIST:</b> <span class='story-highlight'>{_max_merchant}</span> pulled off the largest robbery of <span class='story-amount story-highlight'>₹{_max_txn:,.0f}</span> in the <span class='story-badge badge-info'>{_max_category}</span> category. Truly legendary."))
-
-                # Food saga
-                if _food_t > 0:
-                    _fp = int((_food_t / _total_all) * 100)
-                    _food_jokes = [
-                        f"Your stomach is living its best life while your wallet weeps in the corner.",
-                        f"Swiggy/Zomato delivery guys probably know your address better than your own family now.",
-                        f"You could've bought a small fridge with that money... which you'd fill with more food.",
-                        f"Gordon Ramsay would be proud. Your bank account? Not so much.",
-                    ]
-                    _food_msg = random.choice(_food_jokes)
-                    _badge = "badge-danger" if _fp > 25 else "badge-warn" if _fp > 15 else "badge-success"
-                    _story_items.append(("🍔", f"<b>THE FOOD SAGA:</b> <span class='story-amount story-highlight'>₹{_food_t:,.0f}</span> ({_fp}% of your empire) went straight to your stomach. <span class='story-badge {_badge}'>{_fp}% SHARE</span> {_food_msg}"))
-
-                # Travel adventure
-                if _travel_t > 0:
-                    _tp = int((_travel_t / _total_all) * 100)
-                    _travel_jokes = [
-                        f"Your car/bike thinks it's a money-shredding machine. Petrol companies send you thank-you cards.",
-                        f"You've basically funded an airline pilot's vacation this month.",
-                        f"Uber/Ola drivers consider you their best friend. You're basically their salary.",
-                        f"Every toll booth is a mini ATM and you're the one depositing.",
-                    ]
-                    _travel_msg = random.choice(_travel_jokes)
-                    _badge = "badge-danger" if _tp > 20 else "badge-warn" if _tp > 10 else "badge-success"
-                    _story_items.append(("🚗", f"<b>ROAD WARRIOR:</b> <span class='story-amount story-highlight'>₹{_travel_t:,.0f}</span> ({_tp}%) went to fuel, tolls & rides. <span class='story-badge {_badge}'>{_tp}% SHARE</span> {_travel_msg}"))
-
-                # Gadget spree
-                if _gadget_t > 0:
-                    _gp = int((_gadget_t / _total_all) * 100)
-                    _gadget_jokes = [
-                        f"Amazon/Flipkart's delivery person has you on speed dial. You're basically their VIP customer.",
-                        f"Your house is slowly turning into a gadget showroom. Next: an electronics store?",
-                        f"You bought something shiny and new! Your old gadgets are filing for emotional damages.",
-                        f"Jeff Bezos just whispered 'thank you' from Seattle.",
-                    ]
-                    _gadget_msg = random.choice(_gadget_jokes)
-                    _story_items.append(("📦", f"<b>GADGET SPREE:</b> <span class='story-amount story-highlight'>₹{_gadget_t:,.0f}</span> ({_gp}%) dropped on shiny new things. <span class='story-badge badge-danger'>{_gp}% SHARE</span> {_gadget_msg}"))
-
-                # Entertainment binge
-                if _ent_t > 0:
-                    _ep = int((_ent_t / _total_all) * 100)
-                    _ent_jokes = [
-                        f"Netflix, Prime, Disney+ — you're basically running a personal cinema empire now.",
-                        f"Your couch must be exhausted from all the binge-watching sessions.",
-                        f"Movie tickets or OTT subscriptions? Either way, Hollywood thanks you for your service.",
-                        f"You've watched enough content this month to write a small review blog.",
-                    ]
-                    _ent_msg = random.choice(_ent_jokes)
-                    _badge = "badge-warn" if _ep > 15 else "badge-info"
-                    _story_items.append(("🎬", f"<b>BINGE REPORT:</b> <span class='story-amount'>₹{_ent_t:,.0f}</span> ({_ep}%) on entertainment. <span class='story-badge {_badge}'>{_ep}% SHARE</span> {_ent_msg}"))
-
-                # Shopping haul
-                if _shop_t > 0:
-                    _spct = int((_shop_t / _total_all) * 100)
-                    _shop_jokes = [
-                        f"Your wardrobe is screaming for mercy. Myntra/Ajio are your new best friends.",
-                        f"Retail therapy is real and you're the champion patient. Shopping Olympics gold medalist!",
-                        f"You don't have a shopping problem, you have a 'treat yourself' lifestyle.",
-                        f"The shopping cart said 'add to cart' and you said 'add ALL the things.'",
-                    ]
-                    _shop_msg = random.choice(_shop_jokes)
-                    _badge = "badge-danger" if _spct > 20 else "badge-warn"
-                    _story_items.append(("🛍️", f"<b>RETAIL THERAPY:</b> <span class='story-amount story-highlight'>₹{_shop_t:,.0f}</span> ({_spct}%) on shopping. <span class='story-badge {_badge}'>{_spct}% SHARE</span> {_shop_msg}"))
-
-                # Health is wealth
-                if _health_t > 0:
-                    _hp = int((_health_t / _total_all) * 100)
-                    _story_items.append(("🏥", f"<b>HEALTH INVESTMENT:</b> <span class='story-amount'>₹{_health_t:,.0f}</span> ({_hp}%) on healthcare. <span class='story-badge badge-success'>WELL SPENT</span> Your body thanks you, your wallet... has mixed feelings."))
-
-                # Bills reality check
-                if _bills_t > 0:
-                    _bp = int((_bills_t / _total_all) * 100)
-                    _story_items.append(("📱", f"<b>BILLS CHECK:</b> <span class='story-amount'>₹{_bills_t:,.0f}</span> ({_bp}%) on utilities & bills. The boring stuff that keeps the lights on and WiFi flowing."))
-
-                # Grand stats
-                _story_items.append(("📊", f"<b>BY THE NUMBERS:</b> <span class='story-amount'>₹{_avg:,.0f}</span> avg per transaction | <b>{_txn_count}</b> total hits on your wallet | Single biggest hit: <span class='story-highlight'>₹{_max_txn:,.0f}</span>"))
-
-                # Savings verdict
-                if _total_recv > 0 and _total_spent > 0:
-                    _ratio = _total_recv / _total_spent
-                    if _ratio > 1.5:
-                        _story_items.append(("🏆", f"<b>SAVINGS CHAMPION:</b> Income is <span class='story-good'>{_ratio:.1f}x</span> spending! You're basically a money-saving superhero. Your future self is already thanking you."))
-                    elif _ratio > 1.2:
-                        _story_items.append(("✅", f"<b>DOING WELL:</b> Income is <span class='story-good'>{_ratio:.1f}x</span> spending. You're building wealth while still enjoying life. Balance achieved!"))
-                    elif _ratio > 0.9:
-                        _story_items.append(("⚖️", f"<b>LIVING ON THE EDGE:</b> Income is just <b>{_ratio:.1f}x</b> spending. You're treading water — one big purchase away from either savings or panic."))
+                    # Opening headline
+                    if _total_spent > _total_recv and _total_recv > 0:
+                        _story_items.append(("🔥", f"<b>BREAKING:</b> Your wallet lost <span class='story-amount story-highlight'>{_sym}{_total_spent:,.0f}</span> this month while only <span class='story-amount story-good'>{_sym}{_total_recv:,.0f}</span> trickled back in. That's a <span class='story-highlight'>{((_total_spent/_total_recv - 1)*100):.0f}% overspend rate!</b>"))
+                    elif _total_recv > 0:
+                        _story_items.append(("💰", f"<b>MIRACLE ALERT:</b> You somehow survived {_month_label} spending just <span class='story-amount'>{_sym}{_total_spent:,.0f}</span> while raking in <span class='story-amount story-good'>{_sym}{_total_recv:,.0f}</span>. Your bank account is throwing a party!"))
                     else:
-                        _story_items.append(("⚠️", f"<b>RED ALERT:</b> Spending is <span class='story-highlight'>{(1/_ratio):.1f}x your income!</span> Your wallet is sending SOS signals. Time for a financial intervention!"))
-                elif _total_spent > 0 and _total_recv == 0:
-                    _story_items.append(("🚨", f"<b>NO INCOME DETECTED:</b> Pure spending mode activated. You spent <span class='story-amount story-highlight'>₹{_total_spent:,.0f}</span> with zero credits. Hope you have savings!"))
+                        _story_items.append(("💸", f"<b>EMERGENCY BROADCAST:</b> <span class='story-amount story-highlight'>{_sym}{_total_spent:,.0f}</span> vanished from your accounts in {_month_label}. No salary credits detected. Your money went on an adventure without you."))
 
-                # Closing dramatic line
-                _closing_jokes = [
-                    f"So there you have it — {_month_label}: the month your money went on an epic adventure without you. See you next month!",
-                    f"TL;DR: Your wallet is tired, your bank statement is dramatic, and next month needs to be better. Or... does it? 😏",
-                    f"And that's the story of {_month_label} — where every rupee had a purpose (even if that purpose was pizza at 2 AM).",
-                    f"End of {_month_label} report. Your money has left the building. Mic drop. 🎤",
-                ]
-                _story_items.append(("🎭", f"<i>{random.choice(_closing_jokes)}</i>"))
+                    # Biggest single hit
+                    if _txn_count > 0:
+                        _story_items.append(("🎯", f"<b>BIGGEST HEIST:</b> <span class='story-highlight'>{_max_merchant}</span> pulled off the largest robbery of <span class='story-amount story-highlight'>{_sym}{_max_txn:,.0f}</span> in the <span class='story-badge badge-info'>{_max_category}</span> category. Truly legendary."))
 
-                _story_html = f'<div class="story-card"><h4>📖 Your {_month_label} Money Story — The Dramatic Edition</h4>'
-                for _icon, _text in _story_items:
-                    _story_html += f'<div class="story-item"><span class="story-icon">{_icon}</span><span>{_text}</span></div>'
-                _story_html += '</div>'
+                    # Food saga
+                    if _food_t > 0:
+                        _fp = int((_food_t / _total_all) * 100)
+                        _food_jokes = [
+                            f"Your stomach is living its best life while your wallet weeps in the corner.",
+                            f"Swiggy/Zomato delivery guys probably know your address better than your own family now.",
+                            f"You could've bought a small fridge with that money... which you'd fill with more food.",
+                            f"Gordon Ramsay would be proud. Your bank account? Not so much.",
+                        ]
+                        _food_msg = random.choice(_food_jokes)
+                        _badge = "badge-danger" if _fp > 25 else "badge-warn" if _fp > 15 else "badge-success"
+                        _story_items.append(("🍔", f"<b>THE FOOD SAGA:</b> <span class='story-amount story-highlight'>{_sym}{_food_t:,.0f}</span> ({_fp}% of your empire) went straight to your stomach. <span class='story-badge {_badge}'>{_fp}% SHARE</span> {_food_msg}"))
+
+                    # Travel adventure
+                    if _travel_t > 0:
+                        _tp = int((_travel_t / _total_all) * 100)
+                        _travel_jokes = [
+                            f"Your car/bike thinks it's a money-shredding machine. Petrol companies send you thank-you cards.",
+                            f"You've basically funded an airline pilot's vacation this month.",
+                            f"Uber/Ola drivers consider you their best friend. You're basically their salary.",
+                            f"Every toll booth is a mini ATM and you're the one depositing.",
+                        ]
+                        _travel_msg = random.choice(_travel_jokes)
+                        _badge = "badge-danger" if _tp > 20 else "badge-warn" if _tp > 10 else "badge-success"
+                        _story_items.append(("🚗", f"<b>ROAD WARRIOR:</b> <span class='story-amount story-highlight'>{_sym}{_travel_t:,.0f}</span> ({_tp}%) went to fuel, tolls & rides. <span class='story-badge {_badge}'>{_tp}% SHARE</span> {_travel_msg}"))
+
+                    # Gadget spree
+                    if _gadget_t > 0:
+                        _gp = int((_gadget_t / _total_all) * 100)
+                        _gadget_jokes = [
+                            f"Amazon/Flipkart's delivery person has you on speed dial. You're basically their VIP customer.",
+                            f"Your house is slowly turning into a gadget showroom. Next: an electronics store?",
+                            f"You bought something shiny and new! Your old gadgets are filing for emotional damages.",
+                            f"Jeff Bezos just whispered 'thank you' from Seattle.",
+                        ]
+                        _gadget_msg = random.choice(_gadget_jokes)
+                        _story_items.append(("📦", f"<b>GADGET SPREE:</b> <span class='story-amount story-highlight'>{_sym}{_gadget_t:,.0f}</span> ({_gp}%) dropped on shiny new things. <span class='story-badge badge-danger'>{_gp}% SHARE</span> {_gadget_msg}"))
+
+                    # Entertainment binge
+                    if _ent_t > 0:
+                        _ep = int((_ent_t / _total_all) * 100)
+                        _ent_jokes = [
+                            f"Netflix, Prime, Disney+ — you're basically running a personal cinema empire now.",
+                            f"Your couch must be exhausted from all the binge-watching sessions.",
+                            f"Movie tickets or OTT subscriptions? Either way, Hollywood thanks you for your service.",
+                            f"You've watched enough content this month to write a small review blog.",
+                        ]
+                        _ent_msg = random.choice(_ent_jokes)
+                        _badge = "badge-warn" if _ep > 15 else "badge-info"
+                        _story_items.append(("🎬", f"<b>BINGE REPORT:</b> <span class='story-amount'>{_sym}{_ent_t:,.0f}</span> ({_ep}%) on entertainment. <span class='story-badge {_badge}'>{_ep}% SHARE</span> {_ent_msg}"))
+
+                    # Shopping haul
+                    if _shop_t > 0:
+                        _spct = int((_shop_t / _total_all) * 100)
+                        _shop_jokes = [
+                            f"Your wardrobe is screaming for mercy. Myntra/Ajio are your new best friends.",
+                            f"Retail therapy is real and you're the champion patient. Shopping Olympics gold medalist!",
+                            f"You don't have a shopping problem, you have a 'treat yourself' lifestyle.",
+                            f"The shopping cart said 'add to cart' and you said 'add ALL the things.'",
+                        ]
+                        _shop_msg = random.choice(_shop_jokes)
+                        _badge = "badge-danger" if _spct > 20 else "badge-warn"
+                        _story_items.append(("🛍️", f"<b>RETAIL THERAPY:</b> <span class='story-amount story-highlight'>{_sym}{_shop_t:,.0f}</span> ({_spct}%) on shopping. <span class='story-badge {_badge}'>{_spct}% SHARE</span> {_shop_msg}"))
+
+                    # Health is wealth
+                    if _health_t > 0:
+                        _hp = int((_health_t / _total_all) * 100)
+                        _story_items.append(("🏥", f"<b>HEALTH INVESTMENT:</b> <span class='story-amount'>{_sym}{_health_t:,.0f}</span> ({_hp}%) on healthcare. <span class='story-badge badge-success'>WELL SPENT</span> Your body thanks you, your wallet... has mixed feelings."))
+
+                    # Bills reality check
+                    if _bills_t > 0:
+                        _bp = int((_bills_t / _total_all) * 100)
+                        _story_items.append(("📱", f"<b>BILLS CHECK:</b> <span class='story-amount'>{_sym}{_bills_t:,.0f}</span> ({_bp}%) on utilities & bills. The boring stuff that keeps the lights on and WiFi flowing."))
+
+                    # Grand stats
+                    _story_items.append(("📊", f"<b>BY THE NUMBERS:</b> <span class='story-amount'>{_sym}{_avg:,.0f}</span> avg per transaction | <b>{_txn_count}</b> total hits on your wallet | Single biggest hit: <span class='story-highlight'>{_sym}{_max_txn:,.0f}</span>"))
+
+                    # Savings verdict
+                    if _total_recv > 0 and _total_spent > 0:
+                        _ratio = _total_recv / _total_spent
+                        if _ratio > 1.5:
+                            _story_items.append(("🏆", f"<b>SAVINGS CHAMPION:</b> Income is <span class='story-good'>{_ratio:.1f}x</span> spending! You're basically a money-saving superhero. Your future self is already thanking you."))
+                        elif _ratio > 1.2:
+                            _story_items.append(("✅", f"<b>DOING WELL:</b> Income is <span class='story-good'>{_ratio:.1f}x</span> spending. You're building wealth while still enjoying life. Balance achieved!"))
+                        elif _ratio > 0.9:
+                            _story_items.append(("⚖️", f"<b>LIVING ON THE EDGE:</b> Income is just <b>{_ratio:.1f}x</b> spending. You're treading water — one big purchase away from either savings or panic."))
+                        else:
+                            _story_items.append(("⚠️", f"<b>RED ALERT:</b> Spending is <span class='story-highlight'>{(1/_ratio):.1f}x your income!</span> Your wallet is sending SOS signals. Time for a financial intervention!"))
+                    elif _total_spent > 0 and _total_recv == 0:
+                        _story_items.append(("🚨", f"<b>NO INCOME DETECTED:</b> Pure spending mode activated. You spent <span class='story-amount story-highlight'>{_sym}{_total_spent:,.0f}</span> with zero credits. Hope you have savings!"))
+
+                    # Closing dramatic line
+                    _closing_jokes = [
+                        f"So there you have it — {_month_label}: the month your money went on an epic adventure without you. See you next month!",
+                        f"TL;DR: Your wallet is tired, your bank statement is dramatic, and next month needs to be better. Or... does it? 😏",
+                        f"And that's the story of {_month_label} — where every {_cur_story} unit had a purpose (even if that purpose was pizza at 2 AM).",
+                        f"End of {_month_label} report. Your money has left the building. Mic drop. 🎤",
+                    ]
+                    _story_items.append(("🎭", f"<i>{random.choice(_closing_jokes)}</i>"))
+
+                    _story_html = f'<div class="story-card"><h4>📖 Your {_month_label} {_cur_story} Money Story — The Dramatic Edition</h4>'
+                    for _icon, _text in _story_items:
+                        _story_html += f'<div class="story-item"><span class="story-icon">{_icon}</span><span>{_text}</span></div>'
+                    _story_html += '</div>'
+                    _all_story_html += _story_html
 
                 # ── Significant Purchases Box ────────────────────────────
+                _sym_val = _csym.get(_month_df["currency"].mode().iloc[0] if "currency" in _month_df.columns and not _month_df["currency"].mode().empty else "INR", "\u20b9")
                 # Track A: Electronics / Gadgets / Appliances
                 _elec_kw = (
                     "Samsung|Apple|iPhone|iPad|MacBook|Galaxy|Pixel|OnePlus|Nothing Phone|"
@@ -1480,7 +1701,7 @@ def main():
                     _val_html = (
                         f'<div class="valuebox">'
                         f'<h4>✨ Your {_month_label} Life Upgrades</h4>'
-                        f'<div class="v-subtitle">₹{_val_total:,.0f} invested across <b>{_val_count}</b> upgrades ({_val_pct}% of total spend) — purchases that level up your daily life</div>'
+                        f'<div class="v-subtitle">{_sym_val}{_val_total:,.0f} invested across <b>{_val_count}</b> upgrades ({_val_pct}% of total spend) — purchases that level up your daily life</div>'
                     )
 
                     for _, vr in _val_matches.iterrows():
@@ -1526,7 +1747,7 @@ def main():
                             f'<div class="vcard-header">'
                             f'<span class="vcard-emoji">{_emoji}</span>'
                             f'<span class="vcard-title">{_merchant}</span>'
-                            f'<span class="vcard-amount">₹{_amt:,.0f}</span>'
+                            f'<span class="vcard-amount">{_sym_val}{_amt:,.0f}</span>'
                             f'</div>'
                             f'<div class="vcard-meta">{vr.get("date", "N/A")} | {vr.get("category", "N/A")}</div>'
                             f'<div class="vcard-story">{_story}{_product_hint}</div>'
@@ -1536,17 +1757,17 @@ def main():
 
                     _val_close = [
                         f"That's {_val_count} life upgrade(s) this month. Your lifestyle game is STRONG. 💪",
-                        f"₹{_val_total:,.0f} well spent on things and experiences that matter. No regrets here!",
+                        f"{_sym_val}{_val_total:,.0f} well spent on things and experiences that matter. No regrets here!",
                         f"You're not just spending, you're CURATING A BETTER LIFE. Respect. 🙌",
                     ]
                     _val_html += f'<div class="story-item" style="margin-top:0.8rem;"><span class="story-icon">🏆</span><span><b>VERDICT:</b> {random.choice(_val_close)}</span></div>'
                     _val_html += '</div>'
 
                 # ── Render side by side ──
-                _left, _right = st.columns(2)
-                with _left:
-                    st.markdown(_story_html, unsafe_allow_html=True)
-                with _right:
+                _col_story, _col_val = st.columns(2)
+                with _col_story:
+                    st.markdown(_all_story_html, unsafe_allow_html=True)
+                with _col_val:
                     if _val_html:
                         st.markdown(_val_html, unsafe_allow_html=True)
                     else:
@@ -1603,11 +1824,14 @@ def main():
                     for idx, r in df.iterrows():
                         date_str = str(r.get("date", "")) if pd.notna(r.get("date")) else "N/A"
                         amt = r.get("amount", "")
-                        amt_str = f"₹{float(amt):,.2f}" if pd.notna(amt) and amt != "" else "N/A"
+                        amt_str = f"{_csym}{float(amt):,.2f}" if pd.notna(amt) and amt != "" else "N/A"
                         merchant = str(r.get("merchant", "Unknown")) if pd.notna(r.get("merchant")) else "Unknown"
                         category = str(r.get("category", "Uncategorized")) if pd.notna(r.get("category")) else "Uncategorized"
                         status_val = str(r.get("status", "")) if pd.notna(r.get("status")) else ""
                         currency = str(r.get("currency", "INR")) if pd.notna(r.get("currency")) else "INR"
+                        _csym_map = {"INR": "\u20b9", "GBP": "\u00a3", "USD": "$", "EUR": "\u20ac",
+                                     "AED": "AED ", "SAR": "SAR ", "SGD": "S$", "AUD": "A$", "CAD": "C$", "JPY": "\u00a5"}
+                        _csym = _csym_map.get(currency, currency + " ")
                         raw_text = str(r.get("raw_text", "")) if pd.notna(r.get("raw_text")) else ""
 
                         line = (
@@ -1716,7 +1940,10 @@ def main():
                 st.stop()
 
             parsed_df = pd.json_normalize(parsed_filled, errors='ignore')
-            combined = pd.concat([df[["timestamp", "raw_text", "status"]].reset_index(drop=True), parsed_df.reset_index(drop=True)], axis=1)
+            # Drop currency from parsed_df if present — prefer the actual currency from df
+            if "currency" in parsed_df.columns:
+                parsed_df = parsed_df.drop(columns=["currency"])
+            combined = pd.concat([df[["timestamp", "raw_text", "status", "currency"]].reset_index(drop=True), parsed_df.reset_index(drop=True)], axis=1)
             
             # Prepare data: convert timestamp and amount
             combined["timestamp"] = pd.to_datetime(combined["timestamp"], errors='coerce')
@@ -1728,10 +1955,18 @@ def main():
                 combined["date"] = pd.NaT
             if "status" not in combined.columns:
                 combined["status"] = "Tracked"
-            combined["merchant"] = combined.get("merchant", "Unknown").fillna("Unknown")
-            combined["category"] = combined.get("category", "Uncategorized").fillna("Uncategorized")
-            combined["currency"] = combined.get("currency", "INR").fillna("INR")
-            combined["description"] = combined.get("description", combined["raw_text"]).fillna(combined["raw_text"])
+            if "merchant" not in combined.columns:
+                combined["merchant"] = "Unknown"
+            combined["merchant"] = combined["merchant"].fillna("Unknown")
+            if "category" not in combined.columns:
+                combined["category"] = "Uncategorized"
+            combined["category"] = combined["category"].fillna("Uncategorized")
+            if "currency" not in combined.columns:
+                combined["currency"] = "INR"
+            combined["currency"] = combined["currency"].fillna("INR")
+            if "description" not in combined.columns:
+                combined["description"] = combined["raw_text"]
+            combined["description"] = combined["description"].fillna(combined["raw_text"])
             
             # Classify as debit or credit based on description/merchant keywords
             def classify_transaction(row):
@@ -1751,12 +1986,58 @@ def main():
             
             # Extract merchant from description/merchant column
             if "merchant" not in combined.columns:
-                combined["merchant"] = combined.get("description", "Unknown").fillna("Unknown")
+                if "description" in combined.columns:
+                    combined["merchant"] = combined["description"].fillna("Unknown")
+                else:
+                    combined["merchant"] = "Unknown"
             else:
                 combined["merchant"] = combined["merchant"].fillna("Unknown")
             
-            combined["category"] = combined.get("category", "Uncategorized").fillna("Uncategorized")
-            
+            if "category" not in combined.columns:
+                combined["category"] = "Uncategorized"
+            combined["category"] = combined["category"].fillna("Uncategorized")
+
+            # ── Currency selector + per-currency summary cards ──
+            available_currencies = sorted(combined["currency"].dropna().unique().tolist())
+            cur_sym_map = {c: CURRENCY_DISPLAY.get(c, c + " ") for c in available_currencies}
+
+            section_header("💱 Currency Overview")
+            if len(available_currencies) > 1:
+                cur_cols = st.columns(min(len(available_currencies), 4))
+                for i, cur in enumerate(available_currencies):
+                    cur_df = combined[combined["currency"] == cur]
+                    sym = cur_sym_map[cur]
+                    cur_debit = cur_df[cur_df["txn_type"] == "Debit"]["amount"].sum()
+                    cur_credit = cur_df[cur_df["txn_type"] == "Credit"]["amount"].sum()
+                    cur_count = len(cur_df)
+                    with cur_cols[i % len(cur_cols)]:
+                        st.markdown(
+                            f'<div class="metric-card mc-{"red" if cur_debit > cur_credit else "green"}">'
+                            f'<div class="label">{cur} ({sym.strip()}) — {cur_count} txns</div>'
+                            f'<div class="value">{sym}{cur_debit:,.2f} spent / {sym}{cur_credit:,.2f} received</div>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+            else:
+                cur = available_currencies[0] if available_currencies else "INR"
+                sym = cur_sym_map.get(cur, cur + " ")
+                st.info(f"All records are in **{cur}** ({sym.strip()})")
+
+            # Filter by selected currency
+            if len(available_currencies) > 1:
+                selected_currency = st.selectbox(
+                    "Filter analytics by currency:",
+                    ["All"] + available_currencies,
+                    key="currency_filter",
+                )
+            else:
+                selected_currency = available_currencies[0] if available_currencies else "All"
+
+            if selected_currency != "All":
+                combined = combined[combined["currency"] == selected_currency]
+
+            cur_symbol = cur_sym_map.get(selected_currency, f"{selected_currency} ") if selected_currency != "All" else ""
+
             # Time-based filtering
             section_header("⏰ Filter by Time Period")
             col1, col2, col3 = st.columns(3)
@@ -1784,8 +2065,8 @@ def main():
                     filtered = combined
             elif period == "Yearly":
                 if "date" in combined.columns:
-                    selected_year = st.selectbox("Select year:", 
-                        sorted(combined["date"].dt.year.dropna().unique()), key="year_select")
+                    year_options = sorted(int(y) for y in combined["date"].dt.year.dropna().unique())
+                    selected_year = st.selectbox("Select year:", year_options, key="year_select")
                     filtered = combined[combined["date"].dt.year == selected_year]
                 else:
                     filtered = combined
@@ -1811,11 +2092,11 @@ def main():
             tracked_count = int((filtered["status"] == "Tracked").sum())
             
             with metric_cols[0]:
-                metric_card("Total Debits", f"₹{total_debit:.2f}" if total_debit > 0 else "₹0.00", "mc-red")
+                metric_card("Total Debits", f"{cur_symbol}{total_debit:,.2f}" if total_debit > 0 else f"{cur_symbol}0.00", "mc-red")
             with metric_cols[1]:
-                metric_card("Total Credits", f"₹{total_credit:.2f}" if total_credit > 0 else "₹0.00", "mc-green")
+                metric_card("Total Credits", f"{cur_symbol}{total_credit:,.2f}" if total_credit > 0 else f"{cur_symbol}0.00", "mc-green")
             with metric_cols[2]:
-                metric_card("Net (Credits - Debits)", f"₹{net:.2f}", "mc-blue")
+                metric_card("Net (Credits - Debits)", f"{cur_symbol}{net:,.2f}", "mc-blue")
             with metric_cols[3]:
                 metric_card("Tracked / Untracked", f"{tracked_count} / {untracked_count}", "mc-purple")
             
@@ -1868,7 +2149,7 @@ def main():
             
             # --- Detailed Transaction Table ---
             section_header("📋 All Transactions")
-            display_cols = ["timestamp", "raw_text", "amount", "category", "merchant", "txn_type", "status"]
+            display_cols = ["timestamp", "raw_text", "currency", "amount", "category", "merchant", "txn_type", "status"]
             available_display_cols = [c for c in display_cols if c in filtered.columns]
             st.dataframe(filtered[available_display_cols].sort_values("timestamp", ascending=False))
             
